@@ -749,6 +749,18 @@ These need the owner's call. Do not assume an answer — ask.
 - **Formatting**: `terraform fmt -recursive` before every commit.
 - **Commits**: imperative subjects — "Add payments DFW policy". Reference the
   change ticket for elevated and restricted changes.
+- **Branch and PR names**: `PR<epoch>`, where `<epoch>` is Unix seconds at the
+  moment the branch is created — e.g. `PR1785271876`. The pull request carries
+  the same name as its branch. Take the value once, when you create the branch,
+  and reuse it for the PR; do not regenerate it later, or the two stop matching.
+
+  ```bash
+  BRANCH="PR$(date +%s)"
+  git switch -c "$BRANCH"
+  ```
+
+  The name is an identifier, not a description — what the change does belongs in
+  the commit subjects and the PR body.
 - **PRs**: open as drafts until ready. One site or one application per PR — a PR
   spanning multiple sites cannot be rolled back cleanly.
 
