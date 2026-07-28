@@ -24,16 +24,35 @@ how to keep that from destabilizing the NSX layer.
 
 ### Current state — read before you act
 
-**No Terraform code exists yet.** The repository currently contains only
-`LICENSE` (Apache 2.0) and this file. Everything below is the **target
-architecture**, not a description of code that is already here.
+**The scaffold exists; it has never touched a live manager.**
+`scripts/bootstrap.sh` generates the whole structure below — modules, stacks,
+schemas, tooling, CI, and worked example data — into whatever directory it is
+run in. Everything it writes has been checked offline:
+
+- `terraform fmt -check` is clean and all four stacks pass `terraform validate`
+  against the real `vmware/nsxt` provider.
+- The data → module wiring evaluates: group and policy filtering by owner and
+  site was confirmed with `terraform console`.
+- `scripts/validate-data.py` passes on the example data and was tested against
+  deliberately broken data.
+
+What that verification does **not** cover, and what remains untrue until someone
+does it:
+
+- **No `terraform plan` has ever run against an NSX manager.** Provider schema
+  validity is not API validity.
+- **No `.terraform.lock.hcl` is committed.** Run `terraform init` in a stack and
+  commit the lock file — an unpinned provider across 10+ managers means
+  different sites realize different behaviour.
+- **The state backend is still the placeholder local backend** (open decision
+  1). `scripts/tf.sh` refuses to apply through it without `ALLOW_LOCAL_STATE=1`.
+- **`inventory/managers.yaml` and everything under `data/` is example content**,
+  shaped realistically but describing no real site. Replace it.
 
 Consequences for you:
 
-- Verify with `ls` before referencing any path. Do not cite a module
-  or stack as existing because this document describes it.
-- Do not invent commands. There is no `make`, no CI, no wrapper script yet. If
-  asked how to run something that doesn't exist, say so.
+- Verify with `ls` before referencing any path.
+- Section 16 lists every command that exists. Do not invent others.
 - As real code lands, **replace** the speculative parts of this file with what
   was actually built. Prune what turned out not to apply.
 
@@ -156,7 +175,8 @@ policy objects.
 
 ## 4. Repository structure
 
-Target layout. Nothing here exists yet.
+Created by `scripts/bootstrap.sh`. Re-running it is safe: it never deletes, and
+it keeps any file you have edited unless `--force` is given.
 
 ```
 inventory/
@@ -166,10 +186,14 @@ data/
   groups/                  # group definitions (static + dynamic), per domain/app
   policies/                # DFW policies and rules, per application
   services/                # reusable service definitions
+  network/                 # per-site segments and T1s        (local-network)
+  platform/                # per-site T0s and below           (platform)
   schema/                  # JSON Schema for everything in data/, enforced in CI
+                           # plus tag-scopes.yaml, the tag vocabulary
 modules/
   dfw-policy/              # parent policy + rules from data
   group/                   # group with tag criteria
+  service/                 # custom L4/ICMP services
   segment/
   tier1/
   tier0/
@@ -180,8 +204,14 @@ stacks/
   platform/                # per-LM: T0, transport zones, edge clusters.
 envs/
   <site>.backend.hcl       # partial backend config, one per manager
+scripts/                   # bootstrap, validation, CI matrix, credentials
+docs/STRUCTURE.md          # what each directory is for
 .github/workflows/
 ```
+
+`data/network/` and `data/platform/` are keyed by site: the stack loads
+`data/<kind>/${var.site}.yaml`, and a site with no file plans clean and manages
+nothing.
 
 ### Why the state is split this way
 
@@ -435,10 +465,11 @@ one YAML file and no Terraform code.
 ```yaml
 # data/policies/payments.yaml
 policy:
-  name: prod-payments
+  id: prod-payments                  # deterministic nsx_id; never changes
+  name: prod-payments                # display_name; renaming is metadata-only
   category: Application
-  domain: global
-  scope: [prod-payments-all]        # mandatory Apply To
+  owner: gm                          # gm | lm — which side of the boundary
+  scope: [prod-payments-all]         # mandatory Apply To
   rule_management: standalone        # standalone | inline — never both
 
 rules:
@@ -448,7 +479,7 @@ rules:
     direction: IN
     source_groups: [prod-lb]
     destination_groups: [prod-payments-web]
-    services: [HTTPS]
+    services: [https]
     scope: [prod-payments-web]
     logged: true
 ```
@@ -458,9 +489,15 @@ Rules for this layer:
 - **Map keys are the stable identity.** `web-from-lb` is the Terraform address.
   Renaming a key destroys and recreates the rule; changing a *value* updates it
   in place. Never renumber keys.
-- **CI validates against JSON Schema** in `data/schema/` before any plan runs:
-  required fields present, sequence numbers unique per policy, every referenced
-  group and service exists, `scope` non-empty, tag scopes in the vocabulary.
+- **`owner` decides which stack picks the policy up.** `gm` goes to
+  `global-security`; `lm` requires a `sites` list and goes to `local-security`
+  at those sites only.
+- **CI validates against JSON Schema** in `data/schema/` before any plan runs —
+  `make schema-validate`, which also checks what a schema cannot express:
+  sequence numbers unique per policy, every referenced group and service
+  defined, `scope` non-empty, tag scopes in the vocabulary, no raw policy path
+  or credential pasted into a data file, and no GM policy referencing a
+  site-local group.
 - **Group and service references are by logical name**, resolved to policy paths
   in the module. Never paste raw policy paths into data files.
 - A schema violation fails the PR. This is the cheapest place to catch a
@@ -535,9 +572,7 @@ crash.log
 $EDITOR data/policies/payments.yaml
 
 # 2. Local validation (no credentials, no network)
-terraform fmt -recursive
-terraform validate
-make schema-validate          # once it exists
+make validate                 # = schema-validate + fmt-check
 
 # 3. Open a PR. CI plans against the GM with read-only credentials
 #    and posts the rendered plan summary.
@@ -566,13 +601,23 @@ Before approving any DFW plan, confirm:
 ### Manual commands, when a human asks for them
 
 ```bash
-terraform init -backend-config=envs/${SITE}.backend.hcl
+# Through the wrapper — resolves host and domain from the inventory, keeps one
+# state per stack per manager, and enforces the guardrails below.
+scripts/with-credentials.sh lon1 -- scripts/tf.sh plan local-security lon1
+scripts/tf.sh show local-security lon1
+APPROVE=yes scripts/with-credentials.sh lon1 -- scripts/tf.sh apply local-security lon1
+
+# The same thing by hand.
+cd stacks/local-security
+terraform init -backend-config=../../envs/${SITE}.backend.hcl
 terraform plan -out=tfplan -parallelism=5
 terraform apply -parallelism=5 tfplan
 ```
 
 Always `plan -out` then `apply <file>`. Never a bare `terraform apply` — it
-re-plans at apply time and can execute something nobody reviewed.
+re-plans at apply time and can execute something nobody reviewed. `scripts/tf.sh
+apply` enforces this: it refuses without a saved plan, refuses without
+`APPROVE=yes`, and refuses to apply through the placeholder local backend.
 
 **`-target` is not a workflow.** If plans are slow enough that targeting is
 tempting, the stack is too big — split it (section 4).
@@ -670,10 +715,16 @@ keep it a **separate stack tier with its own state and its own pipeline**:
 These need the owner's call. Do not assume an answer — ask.
 
 1. **State backend** — which backend, where, and how is encryption and locking
-   configured per site?
+   configured per site? *Unresolved.* `stacks/*/backend.tf` currently holds a
+   placeholder `backend "local"` so the stacks initialise for offline
+   validation; `scripts/tf.sh` blocks apply through it. Replace the block and
+   fill in `envs/*.backend.hcl` once decided.
 2. **Vault layout** — auth method for the pipeline, mount and path convention,
-   static KV vs dynamic secrets.
+   static KV vs dynamic secrets. *Unresolved.* `scripts/with-credentials.sh`
+   assumes KV v2 at the full path recorded per manager in the inventory.
 3. **Terragrunt vs CI matrix** for multi-manager instantiation (section 4).
+   *Provisionally: CI matrix*, generated by `scripts/ci-matrix.py`. Revisit only
+   if the duplication demonstrably hurts.
 4. **Category ownership** — does the GM own Environment *and* Application
    categories, or is Application delegated per site?
 5. **Tagging source of truth** — which system authoritatively tags VMs, and does
@@ -690,18 +741,88 @@ These need the owner's call. Do not assume an answer — ask.
 - **Naming**: `<env>-<site>-<app>-<role>`, lowercase, hyphen-separated, e.g.
   `prod-lon1-payments-web`. Terraform identifiers use `snake_case`. Name
   resources for role, not type — `nsxt_policy_group.app_web`, not `group_1`.
+  Federated objects drop the site element — they span every site, so
+  `prod-payments-web` is the whole name.
 - **Modules**: each has `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf`,
   `README.md`. Every variable gets a `description` and a `type`. Defaults only
   where a genuinely safe default exists — never for anything security-relevant.
 - **Formatting**: `terraform fmt -recursive` before every commit.
 - **Commits**: imperative subjects — "Add payments DFW policy". Reference the
   change ticket for elevated and restricted changes.
+- **Branch and PR names**: `PR<epoch>`, where `<epoch>` is Unix seconds at the
+  moment the branch is created — e.g. `PR1785271876`. The pull request carries
+  the same name as its branch. Take the value once, when you create the branch,
+  and reuse it for the PR; do not regenerate it later, or the two stop matching.
+
+  ```bash
+  BRANCH="PR$(date +%s)"
+  git switch -c "$BRANCH"
+  ```
+
+  The name is an identifier, not a description — what the change does belongs in
+  the commit subjects and the PR body.
 - **PRs**: open as drafts until ready. One site or one application per PR — a PR
   spanning multiple sites cannot be rolled back cleanly.
 
-## 16. When you add tooling
+## 16. Tooling
 
-If you introduce CI, `tflint`, `tfsec`/`checkov`, a schema validator, or a
-`Makefile`, document the exact invocation in this file **in the same commit**.
-The value of this document is that every command in it is one that has actually
-been run.
+Every command below has been run. If you introduce more — `tflint`,
+`tfsec`/`checkov`, another validator — document the exact invocation here **in
+the same commit**. The value of this document is that nothing in it is
+aspirational.
+
+### Scaffolding
+
+```bash
+scripts/bootstrap.sh                  # scaffold into the current directory
+scripts/bootstrap.sh --dir PATH       # scaffold somewhere else
+scripts/bootstrap.sh --dry-run        # report what would be written
+scripts/bootstrap.sh --force          # overwrite files that already differ
+scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
+scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
+```
+
+Self-contained: no network, no dependency on the repository it came from, bash
+and coreutils only. Idempotent — an unchanged file is left alone, an edited one
+is kept and reported (exit 2) unless `--force`. It never deletes anything.
+
+### Make targets
+
+```bash
+make help              # list targets
+make preflight         # which required tools are present
+make validate          # schema-validate + fmt-check. Offline, no credentials.
+make schema-validate   # data/ and inventory/ only
+make fmt               # terraform fmt -recursive .
+make fmt-check         # fail if anything is unformatted
+make matrix            # print the CI matrix from inventory/managers.yaml
+make init  STACK=global-security SITE=gm1
+make plan  STACK=global-security SITE=gm1
+make show  STACK=global-security SITE=gm1
+make apply STACK=global-security SITE=gm1   # needs APPROVE=yes
+make clean             # remove local plan files and caches; never touches state
+```
+
+### Scripts
+
+| Command | Does |
+|---|---|
+| `scripts/validate-data.py [--strict] [--quiet]` | Evaluates `data/schema/*.json` against every data file, then the semantic checks a schema cannot express. Exit 1 on error; `--strict` also fails on warnings. |
+| `scripts/ci-matrix.py [--stack S] [--format json\|github\|lines]` | The run matrix from the inventory. |
+| `scripts/ci-matrix.py --export SITE` | Shell exports (`NSX_HOST`, `NSX_VAULT_PATH`, …) for one manager. Paths, never secrets. |
+| `scripts/tf.sh init\|plan\|show\|apply STACK SITE` | Terraform for one stack against one manager. `-parallelism=5`; override with `PARALLELISM`. |
+| `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
+| `scripts/preflight.sh` | Reports missing tools. Read-only. |
+
+`scripts/validate-data.py` and `scripts/ci-matrix.py` need only Python 3.9+;
+PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
+subset when it is not.
+
+### CI
+
+- `.github/workflows/validate.yml` — every PR: `validate-data.py`, `fmt -check`,
+  and `terraform validate` per stack. No credentials, no manager access.
+- `.github/workflows/plan.yml` — every PR: plans each manager from the matrix in
+  parallel with **read-only** credentials, and posts the rendered summary to the
+  job summary. Never attaches the plan file. Requires `VAULT_ADDR` and
+  `VAULT_PLAN_TOKEN` secrets, which are not yet configured.
