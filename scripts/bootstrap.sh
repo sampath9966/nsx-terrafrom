@@ -3761,9 +3761,19 @@ managers:
     domain: default
 SCAFFOLD_EOF
 
+	# Note the heredoc rather than a pipe: each stage of a pipeline runs in a
+	# subshell, so a piped write_file could not update the counters or the
+	# skipped-file exit status.
 	for site in gm1 lon1 nyc1 fra1; do
-		printf '# Partial backend configuration for %s.\n#\n# The backend type is an open decision (docs/ARCHITECTURE.md section 14.1). While the\n# stacks are on the placeholder local backend, scripts/tf.sh supplies the state\n# path itself and this file holds nothing. Once the backend is chosen, put its\n# per-manager settings here — see envs/example.backend.hcl.example.\n' "$site" |
-			write_file "envs/${site}.backend.hcl"
+		write_file "envs/${site}.backend.hcl" <<-EOF
+			# Partial backend configuration for ${site}.
+			#
+			# The backend type is an open decision (docs/ARCHITECTURE.md section 14.1).
+			# While the stacks are on the placeholder local backend, scripts/tf.sh
+			# supplies the state path itself and this file holds nothing. Once the
+			# backend is chosen, put its per-manager settings here — see
+			# envs/example.backend.hcl.example.
+		EOF
 	done
 
 	write_file data/groups/payments.yaml <<'SCAFFOLD_EOF'
