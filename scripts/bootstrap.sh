@@ -18,10 +18,11 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 ROOT="$PWD"
 FORCE=0
+FORCE_DATA=0
 DRY_RUN=0
 QUIET=0
 WITH_EXAMPLES=1
@@ -31,6 +32,7 @@ created=0
 updated=0
 unchanged=0
 skipped=0
+protected=0
 EXECUTABLES=""
 
 usage() {
@@ -42,7 +44,16 @@ Usage: bootstrap.sh [options]
 Options:
   -d, --dir PATH      Target directory (default: current working directory).
                       Created if it does not exist.
-  -f, --force         Overwrite existing files whose content differs.
+  -f, --force         Overwrite existing REGENERATED files whose content
+                      differs — modules, stacks, scripts, CI, schemas, docs.
+                      Never touches estate data. This is the flag to use when
+                      picking up a newer version of the scaffold.
+      --force-data    Also overwrite estate data: data/groups, data/policies,
+                      data/services, data/network, data/platform,
+                      data/schema/tag-scopes.yaml, inventory/ and envs/.
+                      Refuses outright for any file recorded in
+                      data/.import-manifest.json — imported estate is never
+                      overwritten by this script. Implies --force.
       --no-examples   Skip the example data files (inventory entry, groups,
                       policies, services, network and platform data). The
                       structure, modules, stacks, schemas and tooling are
@@ -53,6 +64,11 @@ Options:
   -q, --quiet         Only print the summary and any warnings.
   -h, --help          Show this help.
       --version       Print the bootstrap script version.
+
+Estate data is what describes YOUR network — the rules, groups, segments and
+managers. It is written once, on a first run into an empty directory, and from
+then on it belongs to you. Regenerated files are this script's own output and
+are safe to refresh.
 
 Exit status is 0 on success, 1 on error, 2 if files were skipped because they
 already exist with different content (re-run with --force to overwrite).
@@ -79,6 +95,11 @@ while [ $# -gt 0 ]; do
 		;;
 	-f | --force)
 		FORCE=1
+		shift
+		;;
+	--force-data)
+		FORCE=1
+		FORCE_DATA=1
 		shift
 		;;
 	--no-examples)
@@ -122,13 +143,50 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/nsx-bootstrap.XXXXXX")"
 cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
+MANIFEST="$ROOT/data/.import-manifest.json"
+
+# is_estate_data <relative-path>
+#
+# Estate data describes the customer's network: rules, groups, segments, the
+# manager registry, backend settings. This script writes it once into an empty
+# directory and never again — --force is for refreshing the scaffold's own
+# output, and refreshing the scaffold must not be able to destroy a hand-built
+# or imported ruleset.
+is_estate_data() {
+	case "$1" in
+	data/schema/*.json) return 1 ;; # regenerated: the schemas are this script's
+	data/schema/tag-scopes.yaml) return 0 ;;
+	data/* | inventory/* | envs/*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# is_imported <relative-path> — recorded in the import manifest, i.e. adopted
+# from a live NSX manager. Never overwritten, by any flag.
+is_imported() {
+	[ -f "$MANIFEST" ] || return 1
+	grep -Fq "\"$1\"" "$MANIFEST" 2>/dev/null
+}
+
 # write_file <relative-path> — content is read from stdin.
 write_file() {
 	local rel="$1"
 	local dest="$ROOT/$rel"
 	local tmp="$STAGE/staged"
+	local may_overwrite="$FORCE"
+	local guard=""
 
 	cat >"$tmp"
+
+	if is_estate_data "$rel"; then
+		if is_imported "$rel"; then
+			may_overwrite=0
+			guard="imported from a live manager; recorded in data/.import-manifest.json"
+		else
+			may_overwrite="$FORCE_DATA"
+			guard="estate data; use --force-data to overwrite"
+		fi
+	fi
 
 	if [ -e "$dest" ]; then
 		if [ "$DRY_RUN" = 1 ]; then
@@ -136,9 +194,12 @@ write_file() {
 			if cmp -s "$tmp" "$dest"; then
 				log "  ok       $rel"
 				unchanged=$((unchanged + 1))
-			elif [ "$FORCE" = 1 ]; then
+			elif [ "$may_overwrite" = 1 ]; then
 				log "  would overwrite $rel"
 				updated=$((updated + 1))
+			elif [ -n "$guard" ]; then
+				warn "would keep $rel — $guard"
+				protected=$((protected + 1))
 			else
 				warn "exists with different content, kept: $rel (use --force to overwrite)"
 				skipped=$((skipped + 1))
@@ -148,10 +209,14 @@ write_file() {
 		if cmp -s "$tmp" "$dest"; then
 			log "  ok       $rel"
 			unchanged=$((unchanged + 1))
-		elif [ "$FORCE" = 1 ]; then
+		elif [ "$may_overwrite" = 1 ]; then
 			cat "$tmp" >"$dest"
 			log "  updated  $rel"
 			updated=$((updated + 1))
+		elif [ -n "$guard" ]; then
+			warn "kept $rel — $guard"
+			protected=$((protected + 1))
+			return 0
 		else
 			warn "exists with different content, kept: $rel (use --force to overwrite)"
 			skipped=$((skipped + 1))
@@ -242,6 +307,15 @@ override.tf.json
 # Placeholder local backend output. Never a real manager's state.
 .local-state/
 
+# Drift reports and raw estate dumps. A plan reveals the security posture of
+# the estate; it is not a review attachment.
+reports/
+
+# Sidecars written by import-estate.py when a target already exists. Diff them
+# against the real file, merge by hand, then delete.
+*.yaml.new
+*.tf.new
+
 # Local tool output.
 .bin/
 __pycache__/
@@ -295,6 +369,22 @@ fmt-check: ## Fail if any Terraform file is not canonically formatted
 matrix: ## Print the CI matrix derived from inventory/managers.yaml
 	@$(PYTHON) scripts/ci-matrix.py
 
+.PHONY: add-rule
+add-rule: ## Add a rule to an EXISTING policy. POLICY=<id> RULE=<key> ARGS='--source x --scope y'
+	@$(PYTHON) scripts/add-rule.py --policy "$(POLICY)" --rule "$(RULE)" $(ARGS)
+
+.PHONY: import
+import: ## Adopt an existing estate: SITE=<site> [DUMP=<file>]
+	@if [ -n "$(DUMP)" ]; then \
+		$(PYTHON) scripts/import-estate.py --site "$(SITE)" --from-dump "$(DUMP)"; \
+	else \
+		scripts/with-credentials.sh "$(SITE)" -- $(PYTHON) scripts/import-estate.py --site "$(SITE)"; \
+	fi
+
+.PHONY: drift
+drift: ## Report drift for STACK at SITE. Reports only — never reverts, never writes data/.
+	@scripts/with-credentials.sh "$(SITE)" -- scripts/drift.sh "$(STACK)" "$(SITE)"
+
 .PHONY: init
 init: ## terraform init for STACK against SITE
 	@scripts/tf.sh init "$(STACK)" "$(SITE)"
@@ -340,6 +430,148 @@ indent_size = 4
 
 [Makefile]
 indent_style = tab
+SCAFFOLD_EOF
+
+write_file docs/IMPORT.md <<'SCAFFOLD_EOF'
+# Starting from the estate you already have
+
+You are not building a new network. NSX is already running, the rules already
+carry traffic, and nothing here may create a second copy of any of it.
+
+The whole approach is **adopt, never recreate**: read what exists, write it out
+as data, and hand Terraform the existing objects by id so that the first apply
+changes nothing at all. A tranche is finished when `terraform plan` says *no
+changes* — not when it applies cleanly.
+
+## Before you start
+
+1. `make preflight`
+2. Put the real managers in `inventory/managers.yaml` and add one
+   `envs/<site>.backend.hcl` each.
+3. Pick a **pilot**: one site, one application. Not the busiest one, and not
+   production-critical on the first pass.
+
+## Step 1 — capture the estate
+
+Credentials come from the environment, never from a file:
+
+```bash
+scripts/with-credentials.sh lon1 -- scripts/import-estate.py \
+    --site lon1 --dump-only reports/lon1-raw.json
+```
+
+`reports/` is gitignored. The dump is a read-only snapshot of your security
+posture — treat it like a plan file.
+
+Capturing separately from converting means you can iterate on the conversion
+without hammering the manager, and you can review exactly what was read.
+
+## Step 2 — convert it to data
+
+```bash
+scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
+```
+
+Which writes:
+
+| File | What it holds |
+|---|---|
+| `data/groups/imported-<site>.yaml` | groups, with NSX expressions converted to criteria |
+| `data/policies/<policy-id>.yaml` | one file per policy — this is what makes rule reuse work |
+| `data/services/imported-<site>.yaml` | custom services; predefined ones are referenced, not copied |
+| `stacks/<stack>/import.tf` | the import blocks |
+| `data/.import-manifest.json` | what was imported and from where |
+
+**Nothing you already have is overwritten.** If a target exists the tool writes
+`<name>.new` beside it and tells you, so you diff and merge by hand.
+
+## Step 3 — read what it produced
+
+This is the step people skip. The converter is faithful, not clever:
+
+- Every group with static IP membership gets a placeholder `why_static`. Replace
+  it with the real reason, or make the group dynamic.
+- Tag scopes must exist in `data/schema/tag-scopes.yaml`. Real estates contain
+  scopes nobody documented; add them deliberately rather than in bulk.
+- Rules with an empty `scope` are rules NSX is pushing to every host in the
+  span. The importer records what is there; `make validate` will fail them.
+  That failure is a finding about your estate, not a bug.
+- Object keys are the real nsx_ids and are adopted **verbatim** — mixed case and
+  underscores included. They must match or the import misses. The naming
+  convention applies to objects you create from here on, and the validator
+  knows the difference.
+
+```bash
+make validate
+```
+
+## Step 4 — import one tranche
+
+```bash
+scripts/with-credentials.sh lon1 -- scripts/tf.sh plan local-security lon1
+scripts/tf.sh show local-security lon1
+```
+
+Read the plan against this bar:
+
+- Every object appears as an **import**, not a create.
+- **Zero** creates, updates or destroys. A create means Terraform did not
+  recognise something that exists — stop; do not apply, or you get a duplicate.
+- An update usually means the data does not match reality yet. Fix the data,
+  not the manager.
+
+When the plan is a pure import:
+
+```bash
+APPROVE=yes scripts/with-credentials.sh lon1 -- \
+    scripts/tf.sh apply local-security lon1
+```
+
+Then confirm the follow-up plan is empty, and delete `import.tf` — import blocks
+are one-shot.
+
+### If every import fails with a not-found error
+
+The id format is wrong for your provider version, and **nothing has been written
+to state** — it is a safe failure. Re-run the converter with a different form:
+
+```bash
+scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json --id-format domain-id
+```
+
+`path` (the default), `domain-id` and `id` are the three the nsxt provider has
+used. Confirm on the pilot; the rest of the estate then uses the same one.
+
+## Step 5 — repeat, one tranche at a time
+
+One policy or one site per pass, each its own PR. A PR spanning multiple sites
+cannot be rolled back cleanly.
+
+## After the import: your data is yours
+
+Two guarantees, both enforced rather than documented:
+
+- `bootstrap.sh` will not overwrite estate data with `--force`, and refuses
+  outright — even with `--force-data` — for anything in the import manifest.
+- Drift detection is read-only. `scripts/drift.sh` runs a refresh-only plan,
+  writes its report to `reports/`, and **never** writes back into `data/`. Drift
+  is a ticket for a human, not an automatic rewrite of your imported estate.
+
+## Adding a rule after importing
+
+The point of one-file-per-policy: the rule goes into the policy that already
+exists.
+
+```bash
+scripts/add-rule.py --policy legacy-app --rule allow-monitoring \
+    --source prod-monitoring --destination legacy-web \
+    --service https --scope legacy-web
+```
+
+It finds `legacy-app` by id or display name, appends to that file, and allocates
+the next free sequence number. If the policy does not exist it stops and tells
+you — creating one needs `--create-policy`, because a new policy is a new
+category placement, a new ordering, and a new blast radius.
 SCAFFOLD_EOF
 
 write_file docs/STRUCTURE.md <<'SCAFFOLD_EOF'
@@ -517,7 +749,7 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
   "properties": {
     "groups": {
       "type": "object",
-      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["display_name", "owner"],
@@ -621,8 +853,8 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-          "description": "Deterministic nsx_id. Never changes; renaming display_name stays metadata-only."
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$",
+          "description": "Deterministic nsx_id, adopted verbatim when imported. Never changes; renaming display_name stays metadata-only."
         },
         "name": { "type": "string", "minLength": 1 },
         "description": { "type": "string" },
@@ -651,7 +883,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
     "rules": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["sequence_number", "action", "direction", "scope"],
@@ -696,7 +928,7 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
   "properties": {
     "predefined": {
       "type": "object",
-      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" },
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
       "additionalProperties": {
         "type": "string",
         "description": "display_name of a service that already exists in NSX; looked up, not created."
@@ -704,7 +936,7 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
     },
     "custom": {
       "type": "object",
-      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" },
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["display_name"],
@@ -1281,6 +1513,19 @@ resource "nsxt_policy_parent_security_policy" "this" {
   scope = local.policy_scope
 
   lifecycle {
+    # A policy is reused, never recreated. Adding a rule must land inside the
+    # existing policy; nothing routine may destroy this resource and build a
+    # second one beside it. A destroy here would take every rule in the policy
+    # with it, and on a live DFW that is an outage.
+    #
+    # This also blocks the silent replacements: changing category or domain
+    # forces a new policy, which would drop and rebuild the whole ruleset.
+    #
+    # To genuinely retire a policy: remove this line in a reviewed commit,
+    # apply the destroy, then restore it. That friction is deliberate — policy
+    # deletion is not a routine change.
+    prevent_destroy = true
+
     precondition {
       condition     = length(local.sequence_numbers) == length(distinct(local.sequence_numbers))
       error_message = "Duplicate sequence_number in policy ${var.policy.id}. Sequence numbers are allocated, not guessed."
@@ -2925,6 +3170,32 @@ INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
 SECRET_KEYS = {"password", "passwd", "secret", "token", "api_key", "apikey", "credential", "private_key"}
 FUZZY_OPERATORS = {"CONTAINS", "STARTSWITH", "ENDSWITH", "MATCHES"}
 
+# House style for keys we create. NSX itself permits far more, and an imported
+# estate is full of mixed case and underscores — those keys are the real nsx_ids
+# and must be adopted verbatim, so the convention is only enforced on files this
+# repository authored, not on anything listed in the import manifest.
+CONVENTIONAL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
+
+
+def imported_files() -> set[str]:
+    path = DATA / ".import-manifest.json"
+    if not path.exists():
+        return set()
+    try:
+        return set(json.loads(path.read_text()).get("imported", []))
+    except ValueError:
+        return set()
+
+
+def check_key_style(where: str, kind: str, key: str, imported: set[str], report: Report) -> None:
+    if where in imported or CONVENTIONAL_KEY.match(str(key)):
+        return
+    report.warn(
+        where,
+        f"{kind} key {key!r} is not lowercase-hyphenated. Fine for an imported object — the "
+        "key is its real nsx_id and must match — but new objects should follow the convention.",
+    )
+
 
 class Report:
     def __init__(self) -> None:
@@ -3181,7 +3452,7 @@ def check_tag_value(where: str, label: str, member_type: str, value: str, scopes
         report.warn(where, f"{label}: scope {scope!r} is documented for {', '.join(applies)}, not {member_type}")
 
 
-def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], report: Report) -> dict[str, dict]:
+def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported: set[str], report: Report) -> dict[str, dict]:
     schema = load_schema("group.schema.json")
     groups: dict[str, dict] = {}
     origin: dict[str, str] = {}
@@ -3200,6 +3471,7 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], report: 
                 continue
             groups[name] = group
             origin[name] = where
+            check_key_style(where, "group", name, imported, report)
 
             owner = group.get("owner")
             group_sites = group.get("sites") or []
@@ -3264,7 +3536,7 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], report: 
     return groups
 
 
-def check_services(docs: dict[Path, dict], report: Report) -> dict[str, dict]:
+def check_services(docs: dict[Path, dict], imported: set[str], report: Report) -> dict[str, dict]:
     schema = load_schema("service.schema.json")
     services: dict[str, dict] = {}
     origin: dict[str, str] = {}
@@ -3281,6 +3553,7 @@ def check_services(docs: dict[Path, dict], report: Report) -> dict[str, dict]:
                 continue
             services[name] = {"kind": "predefined", "display_name": display, "owner": None}
             origin[name] = where
+            check_key_style(where, "service", name, imported, report)
 
         for name, service in (doc.get("custom") or {}).items():
             if name in services:
@@ -3290,6 +3563,7 @@ def check_services(docs: dict[Path, dict], report: Report) -> dict[str, dict]:
                 report.error(where, f"service {name!r} has no entries — it would match nothing.")
             services[name] = {"kind": "custom", "owner": service.get("owner", "gm")}
             origin[name] = where
+            check_key_style(where, "service", name, imported, report)
 
     return services
 
@@ -3299,10 +3573,12 @@ def check_policies(
     groups: dict[str, dict],
     services: dict[str, dict],
     sites: set[str],
+    imported: set[str],
     report: Report,
 ) -> None:
     schema = load_schema("policy.schema.json")
     seen_ids: dict[str, str] = {}
+    seen_names: dict[tuple, str] = {}
 
     for path, doc in docs.items():
         where = _rel(path)
@@ -3320,6 +3596,22 @@ def check_policies(
             if policy_id in seen_ids:
                 report.error(where, f"policy id {policy_id!r} is also used in {seen_ids[policy_id]}")
             seen_ids[policy_id] = where
+            check_key_style(where, "policy id", policy_id, imported, report)
+
+        # A policy is reused, not recreated. Two data files describing the same
+        # policy is how a second "policy X" gets built beside the first: same
+        # name, same category, same span, different nsx_id. Adding a rule to an
+        # existing policy means editing its file — scripts/add-rule.py does the
+        # lookup for you.
+        name_key = (policy.get("name"), policy.get("category"), owner, tuple(sorted(policy_sites)))
+        if policy.get("name") and name_key in seen_names:
+            report.error(
+                where,
+                f"policy {policy.get('name')!r} ({policy.get('category')}) is already defined in "
+                f"{seen_names[name_key]}. Add the rule to that policy instead of declaring a "
+                f"second one: scripts/add-rule.py --policy {policy_id or policy.get('name')} ...",
+            )
+        seen_names[name_key] = where
 
         if owner == "lm" and not policy_sites:
             report.error(where, "a site-local policy must list the sites it applies to.")
@@ -3375,6 +3667,7 @@ def check_policies(
             if not isinstance(rule, dict):
                 continue
             label = f"rules.{key}"
+            check_key_style(where, "rule", key, imported, report)
 
             seq = rule.get("sequence_number")
             if isinstance(seq, int):
@@ -3454,9 +3747,10 @@ def main() -> int:
     service_docs = load_docs("services", report)
     policy_docs = load_docs("policies", report)
 
-    groups = check_groups(group_docs, scopes, sites, report)
-    services = check_services(service_docs, report)
-    check_policies(policy_docs, groups, services, sites, report)
+    imported = imported_files()
+    groups = check_groups(group_docs, scopes, sites, imported, report)
+    services = check_services(service_docs, imported, report)
+    check_policies(policy_docs, groups, services, sites, imported, report)
     check_site_files("network", "network.schema.json", scopes, sites, report)
     check_site_files("platform", "platform.schema.json", scopes, sites, report)
 
@@ -3486,6 +3780,879 @@ if __name__ == "__main__":
     raise SystemExit(main())
 SCAFFOLD_EOF
 mark_executable scripts/validate-data.py
+
+write_file scripts/add-rule.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Add a rule to an EXISTING policy. Never create a second one beside it.
+
+A policy is reused, not recreated. If policy X exists, a new rule for X belongs
+inside X — a second policy with the same name means two nsx_ids, two orderings,
+and rules that silently never match because the wrong policy won the sequence.
+
+So this tool looks the policy up first, and only creates one when told to:
+
+  # add a rule to whatever file already holds prod-payments
+  scripts/add-rule.py --policy prod-payments \
+      --rule web-from-monitoring \
+      --action ALLOW --direction IN \
+      --source prod-monitoring --destination prod-payments-web \
+      --service https --scope prod-payments-web
+
+  # policy does not exist yet — refuses unless you say so explicitly
+  scripts/add-rule.py --policy brand-new ... --create-policy \
+      --category Application --owner gm
+
+The policy is found by id, then by display name, across every file in
+data/policies/. The rule is appended to that file, in place, preserving the
+comments around it. Sequence numbers are allocated, not guessed: the next free
+multiple of 100 after the highest existing rule, so there is room to insert.
+
+Nothing here talks to NSX. Run 'make validate' and open a PR as usual.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from yamlcompat import load_yaml  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+POLICY_DIR = REPO_ROOT / "data" / "policies"
+
+
+def find_policy(name: str) -> tuple[Path, dict] | None:
+    """Locate the file already holding this policy. Id first, then display name."""
+    by_name = None
+    for path in sorted(POLICY_DIR.glob("*.yaml")):
+        doc = load_yaml(path.read_text()) or {}
+        policy = doc.get("policy") or {}
+        if policy.get("id") == name:
+            return path, doc
+        if policy.get("name") == name:
+            by_name = (path, doc)
+    return by_name
+
+
+def next_sequence(rules: dict) -> int:
+    highest = 0
+    for rule in rules.values():
+        if isinstance(rule, dict) and isinstance(rule.get("sequence_number"), int):
+            highest = max(highest, rule["sequence_number"])
+    return highest + 100 if highest else 100
+
+
+def yaml_list(values: list[str]) -> str:
+    return "[" + ", ".join(values) + "]"
+
+
+def render_rule(key: str, args, sequence: int) -> str:
+    lines = [f"\n  {key}:", f"    name: {args.rule}"]
+    if args.description:
+        lines.append(f"    description: {args.description}")
+    lines.append(f"    sequence_number: {sequence}")
+    lines.append(f"    action: {args.action}")
+    lines.append(f"    direction: {args.direction}")
+    if args.source:
+        lines.append(f"    source_groups: {yaml_list(args.source)}")
+    if args.destination:
+        lines.append(f"    destination_groups: {yaml_list(args.destination)}")
+    if args.service:
+        lines.append(f"    services: {yaml_list(args.service)}")
+    lines.append(f"    scope: {yaml_list(args.scope)}")
+    lines.append(f"    logged: {'true' if not args.no_log else 'false'}")
+    return "\n".join(lines) + "\n"
+
+
+def create_policy_file(args) -> Path:
+    path = POLICY_DIR / f"{args.policy}.yaml"
+    if path.exists():
+        sys.exit(f"error: {path} already exists")
+    sites = f"\n  sites: {yaml_list(args.sites)}" if args.owner == "lm" else ""
+    path.write_text(
+        f"""# {args.policy}
+#
+# Created by scripts/add-rule.py --create-policy. Review the header before
+# merging: category and scope decide where these rules land and how far they
+# are pushed.
+
+policy:
+  id: {args.policy}
+  name: {args.policy}
+  category: {args.category}
+  owner: {args.owner}{sites}
+  sequence_number: {args.policy_sequence}
+  rule_management: standalone
+  scope: {yaml_list(args.scope)}
+
+rules:
+"""
+    )
+    return path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--policy", required=True, help="policy id or display name; looked up first")
+    ap.add_argument("--rule", required=True, help="rule key and display name")
+    ap.add_argument("--action", default="ALLOW", choices=["ALLOW", "DROP", "REJECT", "JUMP_TO_APPLICATION"])
+    ap.add_argument("--direction", default="IN", choices=["IN", "OUT", "IN_OUT"])
+    ap.add_argument("--source", action="append", default=[], metavar="GROUP")
+    ap.add_argument("--destination", action="append", default=[], metavar="GROUP")
+    ap.add_argument("--service", action="append", default=[], metavar="SERVICE")
+    ap.add_argument("--scope", action="append", default=[], metavar="GROUP", help="Apply To. Mandatory.")
+    ap.add_argument("--description")
+    ap.add_argument("--sequence", type=int, help="override the allocated sequence number")
+    ap.add_argument("--no-log", action="store_true", help="disable logging on this rule")
+    ap.add_argument(
+        "--create-policy",
+        action="store_true",
+        help="create the policy if it genuinely does not exist. Without this, a missing policy is an error.",
+    )
+    ap.add_argument("--category", default="Application", help="only with --create-policy")
+    ap.add_argument("--owner", default="gm", choices=["gm", "lm"], help="only with --create-policy")
+    ap.add_argument("--sites", action="append", default=[], help="only with --create-policy --owner lm")
+    ap.add_argument("--policy-sequence", type=int, default=1000, help="only with --create-policy")
+    ap.add_argument("--dry-run", action="store_true", help="print the rule; write nothing")
+    args = ap.parse_args()
+
+    if not args.scope:
+        sys.exit(
+            "error: --scope is mandatory. A rule without Apply To is pushed to every "
+            "hypervisor in the policy's span."
+        )
+    if not re.match(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", args.rule):
+        sys.exit(f"error: rule key {args.rule!r} must be lowercase, hyphen-separated")
+
+    found = find_policy(args.policy)
+
+    if found is None:
+        if not args.create_policy:
+            existing = []
+            for path in sorted(POLICY_DIR.glob("*.yaml")):
+                doc = load_yaml(path.read_text()) or {}
+                pid = (doc.get("policy") or {}).get("id")
+                if pid:
+                    existing.append(pid)
+            sys.exit(
+                f"error: no policy {args.policy!r} in data/policies/.\n"
+                f"       existing policies: {', '.join(existing) or '(none)'}\n"
+                "       If the rule belongs in one of those, use its name. If this really is a\n"
+                "       new policy, re-run with --create-policy (a new policy is an elevated\n"
+                "       change: new category placement, new ordering, new blast radius)."
+            )
+        if args.owner == "lm" and not args.sites:
+            sys.exit("error: --owner lm needs at least one --sites value")
+        path = create_policy_file(args)
+        doc = load_yaml(path.read_text()) or {}
+        print(f"created {path.relative_to(REPO_ROOT)}")
+    else:
+        path, doc = found
+        print(f"found policy {args.policy!r} in {path.relative_to(REPO_ROOT)} — appending to it")
+
+    rules = doc.get("rules") or {}
+    if args.rule in rules:
+        sys.exit(
+            f"error: rule {args.rule!r} already exists in {path.relative_to(REPO_ROOT)}. "
+            "Edit it there; renaming a rule key destroys and recreates the rule."
+        )
+
+    sequence = args.sequence if args.sequence else next_sequence(rules)
+    if any(
+        isinstance(r, dict) and r.get("sequence_number") == sequence for r in rules.values()
+    ):
+        sys.exit(f"error: sequence_number {sequence} is already used in this policy")
+
+    block = render_rule(args.rule, args, sequence)
+
+    if args.dry_run:
+        print(f"--- would append to {path.relative_to(REPO_ROOT)} ---")
+        print(block, end="")
+        return 0
+
+    text = path.read_text()
+    if not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text + block)
+
+    print(f"added rule {args.rule!r} at sequence {sequence}")
+    print("next: make validate, then open a PR")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/add-rule.py
+
+write_file scripts/import-estate.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Adopt an existing NSX estate into this repository.
+
+The estate exists already. Nothing here creates NSX objects — it reads what is
+there and writes it out as data files plus Terraform import blocks, so that
+Terraform takes ownership of the objects you already run instead of building a
+parallel set beside them.
+
+Two sources:
+
+  # live manager — credentials from the environment, as everywhere else
+  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1
+
+  # offline: capture once, convert as often as you like
+  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1 \
+      --dump-only reports/lon1-raw.json
+  scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
+
+What it writes (never over the top of anything):
+
+  data/groups/imported-<site>.yaml     groups, criteria converted from expressions
+  data/policies/<policy-id>.yaml       one file per policy, so add-rule.py finds it
+  data/services/imported-<site>.yaml   custom services; predefined ones referenced
+  stacks/<stack>/import.tf             import blocks for terraform
+  data/.import-manifest.json           what was imported, and from where
+
+If a target file already exists it is written as <name>.new and reported. Your
+data is never overwritten by this tool, and bootstrap.sh refuses to overwrite
+anything listed in the manifest even with --force-data.
+
+IMPORT ID FORMAT: policy resources in the nsxt provider have taken more than
+one import id format across versions — the policy path, or "domain/id". This
+script defaults to the path and can emit either (--id-format). Confirm on your
+first tranche: a wrong format fails immediately and harmlessly at plan time
+with a "not found" style error, before anything is written to state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA = REPO_ROOT / "data"
+MANIFEST = DATA / ".import-manifest.json"
+
+GM_BASE = "/global-manager/api/v1/global-infra"
+LM_BASE = "/policy/api/v1/infra"
+
+
+# --------------------------------------------------------------------------
+# Fetching
+# --------------------------------------------------------------------------
+
+def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> dict:
+    url = f"https://{host}{path}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    credentials = urllib.parse.quote(user), urllib.parse.quote(password)
+    import base64
+
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    request.add_header("Authorization", f"Basic {token}")
+
+    context = ssl.create_default_context()
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=60) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"error: {exc.code} from {path}: {exc.read()[:300].decode(errors='replace')}")
+    except urllib.error.URLError as exc:
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+            hint = (
+                "\n       The manager is presenting a certificate this machine does not trust. "
+                "Install the CA, or re-run with --insecure if you accept the risk on a lab."
+            )
+        sys.exit(f"error: cannot reach {host}: {exc.reason}{hint}")
+
+
+def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
+    def results(path: str) -> list:
+        return api_get(host, path, user, password, insecure).get("results", [])
+
+    print(f"reading {host} ({base}, domain {domain})", file=sys.stderr)
+    groups = results(f"{base}/domains/{domain}/groups")
+    print(f"  {len(groups)} group(s)", file=sys.stderr)
+    services = results(f"{base}/services")
+    print(f"  {len(services)} service(s)", file=sys.stderr)
+
+    policies = []
+    for summary in results(f"{base}/domains/{domain}/security-policies"):
+        # The list endpoint omits rules; fetch each policy in full.
+        policies.append(
+            api_get(
+                host,
+                f"{base}/domains/{domain}/security-policies/{summary['id']}",
+                user,
+                password,
+                insecure,
+            )
+        )
+    print(f"  {len(policies)} policy/policies", file=sys.stderr)
+
+    return {"groups": groups, "services": services, "policies": policies, "domain": domain}
+
+
+# --------------------------------------------------------------------------
+# YAML emitting — small and controlled, so output is stable and diffable.
+# --------------------------------------------------------------------------
+
+NEEDS_QUOTE = set(":{}[],&*#?|-<>=!%@`\"'")
+
+
+def scalar(value) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if (
+        text == ""
+        or text[0] in NEEDS_QUOTE
+        or text.strip() != text
+        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
+        or any(c in text for c in ":#")
+        or _looks_numeric(text)
+    ):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
+
+
+def emit(value, indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    lines: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, dict) and item:
+                lines.append(f"{pad}{key}:")
+                lines.extend(emit(item, indent + 1))
+            elif isinstance(item, list) and item:
+                if all(not isinstance(x, (dict, list)) for x in item):
+                    lines.append(f"{pad}{key}: [{', '.join(scalar(x) for x in item)}]")
+                else:
+                    lines.append(f"{pad}{key}:")
+                    lines.extend(emit(item, indent + 1))
+            elif isinstance(item, (dict, list)):
+                lines.append(f"{pad}{key}: {{}}" if isinstance(item, dict) else f"{pad}{key}: []")
+            else:
+                lines.append(f"{pad}{key}: {scalar(item)}")
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                rendered = emit(item, indent + 1)
+                first = rendered[0].lstrip()
+                lines.append(f"{pad}- {first}")
+                lines.extend(rendered[1:])
+            else:
+                lines.append(f"{pad}- {scalar(item)}")
+    return lines
+
+
+def to_yaml(value) -> str:
+    return "\n".join(emit(value)) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Conversion
+# --------------------------------------------------------------------------
+
+def condition(expression: dict) -> dict:
+    return {
+        "key": expression.get("key", "Tag"),
+        "member_type": expression.get("member_type", "VirtualMachine"),
+        "operator": expression.get("operator", "EQUALS"),
+        "value": expression.get("value", ""),
+    }
+
+
+def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str]) -> dict:
+    criteria: list[dict] = []
+    conjunction = None
+    static = False
+
+    for expression in group.get("expression", []):
+        kind = expression.get("resource_type")
+        if kind == "Condition":
+            criteria.append({"conditions": [condition(expression)]})
+        elif kind == "NestedExpression":
+            conditions = [
+                condition(inner)
+                for inner in expression.get("expressions", [])
+                if inner.get("resource_type") == "Condition"
+            ]
+            if conditions:
+                criteria.append({"conditions": conditions})
+        elif kind == "IPAddressExpression":
+            criteria.append({"ip_addresses": expression.get("ip_addresses", [])})
+            static = True
+        elif kind == "PathExpression":
+            criteria.append(
+                {"member_groups": [path_to_name.get(p, p) for p in expression.get("paths", [])]}
+            )
+        elif kind == "ConjunctionOperator":
+            conjunction = expression.get("conjunction_operator")
+
+    out: dict = {"display_name": group.get("display_name", group["id"]), "owner": owner}
+    if group.get("description"):
+        out["description"] = group["description"]
+    if owner == "lm":
+        out["sites"] = list(sites)
+    if static:
+        out["why_static"] = (
+            "IMPORTED AS-IS from the live manager. Replace this note with the real reason "
+            "the membership is static, and what would let it become dynamic."
+        )
+    if conjunction and len(criteria) > 1:
+        out["conjunction"] = conjunction
+    if criteria:
+        out["criteria"] = criteria
+    return out
+
+
+def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
+    def names(paths, lookup):
+        out = []
+        for path in paths or []:
+            if path == "ANY":
+                continue
+            out.append(lookup.get(path, path))
+        return out
+
+    converted: dict = {
+        "name": rule.get("display_name", rule["id"]),
+        "sequence_number": rule.get("sequence_number", 100),
+        "action": rule.get("action", "ALLOW"),
+        "direction": rule.get("direction", "IN_OUT"),
+    }
+    if rule.get("description"):
+        converted["description"] = rule["description"]
+    if rule.get("ip_protocol") and rule["ip_protocol"] != "IPV4_IPV6":
+        converted["ip_version"] = rule["ip_protocol"]
+
+    sources = names(rule.get("source_groups"), group_paths)
+    destinations = names(rule.get("destination_groups"), group_paths)
+    services = names(rule.get("services"), service_paths)
+    scope = names(rule.get("scope"), group_paths)
+
+    if sources:
+        converted["source_groups"] = sources
+    if destinations:
+        converted["destination_groups"] = destinations
+    if services:
+        converted["services"] = services
+    if rule.get("sources_excluded"):
+        converted["sources_excluded"] = True
+    if rule.get("destinations_excluded"):
+        converted["destinations_excluded"] = True
+    if rule.get("disabled"):
+        converted["disabled"] = True
+    converted["logged"] = bool(rule.get("logged", False))
+    converted["scope"] = scope
+    return converted
+
+
+def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: str, sites: list[str]) -> dict:
+    header: dict = {
+        "id": policy["id"],
+        "name": policy.get("display_name", policy["id"]),
+        "category": policy.get("category", "Application"),
+        "owner": owner,
+    }
+    if policy.get("description"):
+        header["description"] = policy["description"]
+    if owner == "lm":
+        header["sites"] = list(sites)
+    header["sequence_number"] = policy.get("sequence_number", 100)
+    if policy.get("stateful") is False:
+        header["stateful"] = False
+    if policy.get("locked"):
+        header["locked"] = True
+    header["rule_management"] = "standalone"
+    header["scope"] = [
+        group_paths.get(p, p) for p in policy.get("scope", []) if p != "ANY"
+    ]
+
+    rules = {}
+    for rule in policy.get("rules", []):
+        rules[rule["id"]] = convert_rule(rule, group_paths, service_paths)
+
+    return {"policy": header, "rules": rules}
+
+
+def convert_service(service: dict) -> dict:
+    out: dict = {"display_name": service.get("display_name", service["id"])}
+    if service.get("description"):
+        out["description"] = service["description"]
+    l4: list[dict] = []
+    icmp: list[dict] = []
+    for entry in service.get("service_entries", []):
+        kind = entry.get("resource_type")
+        if kind == "L4PortSetServiceEntry":
+            item = {
+                "protocol": entry.get("l4_protocol", "TCP"),
+                "destination_ports": [str(p) for p in entry.get("destination_ports", [])],
+            }
+            if entry.get("source_ports"):
+                item["source_ports"] = [str(p) for p in entry["source_ports"]]
+            l4.append(item)
+        elif kind == "ICMPTypeServiceEntry":
+            item = {"protocol": entry.get("protocol", "ICMPv4")}
+            if entry.get("icmp_type") is not None:
+                item["icmp_type"] = str(entry["icmp_type"])
+            if entry.get("icmp_code") is not None:
+                item["icmp_code"] = str(entry["icmp_code"])
+            icmp.append(item)
+    if l4:
+        out["l4_port_set"] = l4
+    if icmp:
+        out["icmp"] = icmp
+    return out
+
+
+def is_system(obj: dict) -> bool:
+    return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system"
+
+
+# --------------------------------------------------------------------------
+# Writing
+# --------------------------------------------------------------------------
+
+class Writer:
+    def __init__(self, dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.written: list[str] = []
+        self.deferred: list[str] = []
+
+    def write(self, path: Path, text: str) -> None:
+        rel = str(path.relative_to(REPO_ROOT))
+        target = path
+        if path.exists():
+            target = path.with_suffix(path.suffix + ".new")
+            self.deferred.append(f"{rel} -> {target.name}")
+        else:
+            self.written.append(rel)
+        if self.dry_run:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+
+def import_block(address: str, identifier: str) -> str:
+    return f'import {{\n  to = {address}\n  id = "{identifier}"\n}}\n\n'
+
+
+def object_id(kind: str, domain: str, path: str, nsx_id: str, fmt: str) -> str:
+    if fmt == "path":
+        return path
+    if fmt == "domain-id":
+        return f"{domain}/{nsx_id}"
+    return nsx_id
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--site", required=True, help="manager id from inventory/managers.yaml")
+    ap.add_argument("--domain", default=None, help="NSX domain (default: 'default', or 'global' on a GM)")
+    ap.add_argument("--role", choices=["gm", "lm"], default=None, help="override the role from the inventory")
+    ap.add_argument("--from-dump", metavar="FILE", help="convert a previously captured dump instead of calling the API")
+    ap.add_argument("--dump-only", metavar="FILE", help="capture the raw API responses and stop")
+    ap.add_argument("--id-format", choices=["path", "domain-id", "id"], default="path")
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification (lab only)")
+    ap.add_argument("--dry-run", action="store_true", help="report what would be written")
+    args = ap.parse_args()
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    inventory_path = REPO_ROOT / "inventory" / "managers.yaml"
+    managers = {}
+    if inventory_path.exists():
+        managers = (load_yaml(inventory_path.read_text()) or {}).get("managers") or {}
+    manager = managers.get(args.site, {})
+    role = args.role or manager.get("role", "lm")
+    domain = args.domain or manager.get("domain") or ("global" if role == "gm" else "default")
+    base = GM_BASE if role == "gm" else LM_BASE
+
+    if args.from_dump:
+        estate = json.loads(Path(args.from_dump).read_text())
+        domain = estate.get("domain", domain)
+    else:
+        host = os.environ.get("NSXT_MANAGER_HOST") or manager.get("host")
+        user = os.environ.get("NSXT_USERNAME")
+        password = os.environ.get("NSXT_PASSWORD")
+        if not (host and user and password):
+            sys.exit(
+                "error: no credentials in the environment. Wrap the call:\n"
+                f"       scripts/with-credentials.sh {args.site} -- scripts/import-estate.py --site {args.site}"
+            )
+        estate = fetch_estate(host, user, password, base, domain, args.insecure)
+
+    if args.dump_only:
+        out = Path(args.dump_only)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(estate, indent=2))
+        print(f"wrote {out}")
+        return 0
+
+    groups = estate.get("groups", [])
+    services = estate.get("services", [])
+    policies = estate.get("policies", [])
+    sites = [args.site]
+    owner = "gm" if role == "gm" else "lm"
+
+    group_paths = {g["path"]: g["id"] for g in groups if g.get("path")}
+    service_paths = {s["path"]: s["id"] for s in services if s.get("path")}
+
+    writer = Writer(args.dry_run)
+
+    # --- groups ---------------------------------------------------------
+    converted_groups = {
+        g["id"]: convert_group(g, group_paths, owner, sites) for g in groups if not is_system(g)
+    }
+    if converted_groups:
+        header = (
+            f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
+            "#\n"
+            "# Review before the first apply: check every 'why_static' note, and confirm\n"
+            "# the tag scopes below are in data/schema/tag-scopes.yaml.\n\n"
+        )
+        writer.write(DATA / "groups" / f"imported-{args.site}.yaml", header + to_yaml({"groups": converted_groups}))
+
+    # --- services -------------------------------------------------------
+    custom = {s["id"]: convert_service(s) for s in services if not is_system(s)}
+    predefined = {
+        s["id"]: s.get("display_name", s["id"])
+        for s in services
+        if is_system(s) and _referenced(s, policies)
+    }
+    if custom or predefined:
+        document: dict = {}
+        if predefined:
+            document["predefined"] = predefined
+        if custom:
+            for definition in custom.values():
+                definition["owner"] = owner
+            document["custom"] = custom
+        header = f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
+        writer.write(DATA / "services" / f"imported-{args.site}.yaml", header + to_yaml(document))
+
+    # --- policies: one file each, so add-rule.py can find them ----------
+    for policy in policies:
+        if is_system(policy):
+            continue
+        document = convert_policy(policy, group_paths, service_paths, owner, sites)
+        header = (
+            f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
+            "#\n"
+            "# A new rule for this policy belongs IN THIS FILE. Do not declare a second\n"
+            f"# policy: scripts/add-rule.py --policy {policy['id']} --rule <name> ...\n\n"
+        )
+        writer.write(DATA / "policies" / f"{policy['id']}.yaml", header + to_yaml(document))
+
+    # --- import blocks --------------------------------------------------
+    security_stack = "global-security" if role == "gm" else "local-security"
+    blocks = [
+        "# Generated by scripts/import-estate.py. Adopt existing objects into state.\n"
+        "#\n"
+        "# Run one tranche at a time:\n"
+        "#   scripts/tf.sh plan " + security_stack + " " + args.site + "\n"
+        "# and confirm the plan is a pure import with NO resource changes before\n"
+        "# applying. A tranche is done when plan reports no changes.\n"
+        "#\n"
+        f"# id format: {args.id_format}. If every import fails with a not-found error,\n"
+        "# re-run import-estate.py with a different --id-format; nothing has been\n"
+        "# written to state at that point.\n"
+        "#\n"
+        "# Delete this file once the imports are applied — import blocks are one-shot.\n\n"
+    ]
+    for group_id, definition in converted_groups.items():
+        nested = any("member_groups" in c for c in definition.get("criteria", []))
+        module = "composite_groups" if nested else "base_groups"
+        path = next((g["path"] for g in groups if g["id"] == group_id), "")
+        blocks.append(
+            import_block(
+                f'module.{module}.nsxt_policy_group.this["{group_id}"]',
+                object_id("group", domain, path, group_id, args.id_format),
+            )
+        )
+    for policy in policies:
+        if is_system(policy):
+            continue
+        key = policy["id"]
+        blocks.append(
+            import_block(
+                f'module.policies["{key}"].nsxt_policy_parent_security_policy.this',
+                object_id("policy", domain, policy.get("path", ""), key, args.id_format),
+            )
+        )
+        for rule in policy.get("rules", []):
+            rule_path = rule.get("path", "")
+            blocks.append(
+                import_block(
+                    f'module.policies["{key}"].nsxt_policy_security_policy_rule.this["{rule["id"]}"]',
+                    object_id("rule", domain, rule_path, f"{key}/{rule['id']}", args.id_format),
+                )
+            )
+    writer.write(REPO_ROOT / "stacks" / security_stack / "import.tf", "".join(blocks))
+
+    # --- manifest -------------------------------------------------------
+    manifest = {"version": 1, "imported": [], "sources": []}
+    if MANIFEST.exists():
+        try:
+            manifest = json.loads(MANIFEST.read_text())
+        except ValueError:
+            pass
+    for rel in writer.written:
+        if rel not in manifest["imported"]:
+            manifest["imported"].append(rel)
+    manifest["sources"].append(
+        {
+            "site": args.site,
+            "role": role,
+            "domain": domain,
+            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "counts": {
+                "groups": len(converted_groups),
+                "policies": len([p for p in policies if not is_system(p)]),
+                "rules": sum(len(p.get("rules", [])) for p in policies if not is_system(p)),
+                "services": len(custom),
+            },
+        }
+    )
+    if not args.dry_run:
+        MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    # --- report ---------------------------------------------------------
+    print()
+    for rel in writer.written:
+        print(f"  wrote     {rel}")
+    for note in writer.deferred:
+        print(f"  EXISTS    {note}  (your file was not touched — diff and merge by hand)")
+    print()
+    print(f"{len(converted_groups)} group(s), {len([p for p in policies if not is_system(p)])} policy/policies, "
+          f"{sum(len(p.get('rules', [])) for p in policies if not is_system(p))} rule(s), {len(custom)} custom service(s)")
+    if args.dry_run:
+        print("dry run — nothing was written.")
+        return 0
+    print()
+    print("next:")
+    print("  1. make validate")
+    print(f"  2. scripts/tf.sh plan {security_stack} {args.site}")
+    print("  3. confirm the plan imports and changes NOTHING, then apply")
+    print(f"  4. delete stacks/{security_stack}/import.tf once applied")
+    return 0
+
+
+def _referenced(service: dict, policies: list) -> bool:
+    path = service.get("path")
+    for policy in policies:
+        for rule in policy.get("rules", []):
+            if path in (rule.get("services") or []):
+                return True
+    return False
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/import-estate.py
+
+write_file scripts/drift.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Detect drift. Report it. Change nothing.
+#
+#   scripts/with-credentials.sh lon1 -- scripts/drift.sh local-security lon1
+#
+# Administrators make UI changes, especially during an incident. This tells you
+# what diverged; it never reverts, and it never writes back into data/. An
+# auto-revert during an active incident undoes the fix someone applied to stop
+# an outage, and a tool that rewrites your data files on a drift signal would
+# quietly overwrite the estate you imported.
+#
+# Reports go to reports/, which is gitignored: a plan reveals the security
+# posture of the estate and is not a review attachment.
+#
+# Exit status: 0 no drift, 1 error, 2 drift detected.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+[ $# -ge 2 ] || {
+	echo "usage: drift.sh <stack> <site>" >&2
+	exit 1
+}
+
+stack="$1"
+site="$2"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+report_dir="$REPO_ROOT/reports"
+report="$report_dir/drift-${stack}-${site}-${stamp}.txt"
+
+mkdir -p "$report_dir"
+
+# -refresh-only compares state against the live manager without proposing any
+# configuration change, so nothing here can be mistaken for a fix.
+"$REPO_ROOT/scripts/tf.sh" init "$stack" "$site" >/dev/null 2>&1
+
+(cd "$REPO_ROOT/stacks/$stack" && terraform plan -refresh-only -detailed-exitcode -input=false -no-color) \
+	>"$report" 2>&1
+status=$?
+
+case "$status" in
+0)
+	echo "no drift: $stack @ $site"
+	rm -f "$report"
+	exit 0
+	;;
+2)
+	echo "DRIFT DETECTED: $stack @ $site"
+	echo "report: ${report#"$REPO_ROOT"/}"
+	echo
+	grep -E '^\s*[~+-]|will be updated|has changed|Objects have changed' "$report" | head -40
+	echo
+	echo "This is a ticket, not an auto-fix. Either bring the change into data/ or"
+	echo "revert it deliberately. Nothing in data/ has been modified."
+	exit 2
+	;;
+*)
+	echo "error running the refresh-only plan; see ${report#"$REPO_ROOT"/}" >&2
+	exit 1
+	;;
+esac
+SCAFFOLD_EOF
+mark_executable scripts/drift.sh
 
 # ---------------------------------------------------------------------------
 # 7. Backend config and CI
@@ -4267,6 +5434,7 @@ log "  created   $created"
 log "  updated   $updated"
 log "  unchanged $unchanged"
 [ "$skipped" -gt 0 ] && log "  skipped   $skipped (existing files with different content)"
+[ "$protected" -gt 0 ] && log "  protected $protected (your estate data, left untouched)"
 
 if [ "$DRY_RUN" = 1 ]; then
 	log ""
