@@ -97,10 +97,16 @@ initialise for offline validation. **It is not acceptable for a real manager.**
 Pick one with a flag rather than editing the stacks by hand:
 
 ```bash
-./scripts/bootstrap.sh --force --backend http      # GitLab-managed state
-./scripts/bootstrap.sh --force --backend s3        # S3, MinIO, Ceph RGW
-./scripts/bootstrap.sh --force --backend azurerm
+./scripts/bootstrap.sh --force --backend gitlab    # GitLab-managed state
+./scripts/bootstrap.sh --force --backend s3        # or minio, ceph
+./scripts/bootstrap.sh --force --backend azure
+./scripts/bootstrap.sh --force --backend local     # filesystem on this server
 ```
+
+The flag takes the Terraform backend type (`http`, `s3`, `azurerm`, `local`) or
+a friendly name for it — `gitlab` is `http`, `minio` and `ceph` are `s3`,
+`azure` is `azurerm`, `file`/`filesystem`/`server` are `local`. Case does not
+matter.
 
 Whatever you choose needs three things. The third is the one people skip:
 
@@ -111,7 +117,7 @@ Whatever you choose needs three things. The third is the one people skip:
    pipeline job and an engineer running the same site at once will corrupt the
    state file, and Terraform will not warn you.
 
-#### GitLab-managed state — `--backend http`
+#### GitLab-managed state — `--backend gitlab`
 
 If you have GitLab, this is the least work: locking, encryption at rest and
 version history come from GitLab, with no object store to run.

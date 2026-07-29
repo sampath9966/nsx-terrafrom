@@ -813,7 +813,7 @@ These need the owner's call. Do not assume an answer — ask.
    placeholder `backend "local"` so the stacks initialise for offline
    validation; `scripts/tf.sh` blocks apply through it.
 
-   `scripts/bootstrap.sh --force --backend http|s3|azurerm|local` writes the
+   `scripts/bootstrap.sh --force --backend gitlab|s3|azure|local` writes the
    chosen one; then fill in `envs/*.backend.hcl`. `http` is GitLab-managed
    Terraform state, which supplies locking, encryption at rest and version
    history with no object store to run — the least-effort option for a GitLab
@@ -899,7 +899,7 @@ scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
 scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
-scripts/bootstrap.sh --backend TYPE   # http (GitLab) | s3 | azurerm | local
+scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
 

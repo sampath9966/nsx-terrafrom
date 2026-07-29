@@ -59,21 +59,25 @@ Options:
                       policies, services, network and platform data). The
                       structure, modules, stacks, schemas and tooling are
                       still written.
-      --backend TYPE  State backend written into stacks/*/backend.tf:
+      --backend TYPE  State backend written into stacks/*/backend.tf. Case
+                      insensitive; the friendly names in brackets also work.
 
-                        http     GitLab-managed Terraform state. Locking,
-                                 encryption at rest and versioning come from
-                                 GitLab; credentials from TF_HTTP_USERNAME and
-                                 TF_HTTP_PASSWORD, never from a committed file.
-                        s3       S3 or any S3-compatible object store (MinIO,
-                                 Ceph) with DynamoDB or native locking.
-                        azurerm  Azure blob storage.
-                        local    Filesystem state on this server. NO LOCKING.
-                                 The default, and the placeholder: it exists so
-                                 the stacks initialise for offline validation.
+                        http     GitLab-managed Terraform state  [gitlab]
+                                 Locking, encryption at rest and versioning
+                                 come from GitLab. Credentials come from
+                                 TF_HTTP_USERNAME and TF_HTTP_PASSWORD, never
+                                 from a committed file.
+                        s3       S3 or an S3-compatible store  [minio, ceph]
+                                 Needs DynamoDB or native locking configured.
+                        azurerm  Azure blob storage  [azure]
+                        local    Filesystem on this server  [file, filesystem]
+                                 NO LOCKING. The default, and the placeholder:
+                                 it exists so the stacks initialise for offline
+                                 validation.
 
                       Whatever you choose, state carries the full security
-                      posture of the estate. Never commit it to git.
+                      posture of the estate. It never goes in a git repository:
+                      plaintext, permanent history, and no locking.
       --git-init      Run 'git init' in the target directory if it is not
                       already inside a git working tree.
   -n, --dry-run       Report what would be written; change nothing.
@@ -155,9 +159,31 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# The Terraform backend type is what goes in backend.tf, but nobody thinks in
+# those terms — GitLab-managed state is the 'http' backend, and MinIO and Ceph
+# are the 's3' one. Accept what a person would actually type.
+BACKEND="$(printf '%s' "$BACKEND" | tr '[:upper:]' '[:lower:]')"
+case "$BACKEND" in
+gitlab | gitlab-managed | tfstate-http) BACKEND=http ;;
+file | filesystem | disk | server) BACKEND=local ;;
+minio | ceph) BACKEND=s3 ;;
+azure | blob) BACKEND=azurerm ;;
+esac
+
 case "$BACKEND" in
 local | http | s3 | azurerm) ;;
-*) die "unknown backend: $BACKEND (expected one of: local, http, s3, azurerm)" ;;
+git | github | repo)
+	die "state does not belong in a git repository: it is plaintext, git history is
+       permanent, and git has no locking, so two runs diverge silently. For
+       GitLab-managed Terraform state — an API GitLab hosts, not a file in a
+       repository — use --backend gitlab."
+	;;
+*)
+	die "unknown backend: $BACKEND
+       Valid types: local, http, s3, azurerm
+       Also accepted: gitlab (=http), minio/ceph (=s3), azure (=azurerm),
+                      file/filesystem/disk/server (=local)"
+	;;
 esac
 
 if [ ! -d "$ROOT" ]; then
@@ -689,8 +715,8 @@ Then, in order:
 2. Add one `envs/<site>.backend.hcl` per manager.
 3. **Decide the state backend.** The default is a placeholder `backend "local"`,
    which has no locking and is not acceptable for a real manager. Pick one with
-   `scripts/bootstrap.sh --force --backend http|s3|azurerm` — `http` is
-   GitLab-managed state — then fill in `envs/<site>.backend.hcl`.
+   `scripts/bootstrap.sh --force --backend gitlab|s3|azure|local`, then fill in
+   `envs/<site>.backend.hcl`.
 4. `terraform init` in one stack and commit the `.terraform.lock.hcl`.
 5. Adopt what already exists: `make import SITE=<site>`, per `docs/IMPORT.md`.
 
