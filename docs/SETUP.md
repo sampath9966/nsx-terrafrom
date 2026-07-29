@@ -92,31 +92,80 @@ The generator refuses to guess these. They are listed in
 ### 2.1 State backend — blocking
 
 `stacks/*/backend.tf` ships a placeholder `backend "local" {}` so the stacks
-initialise for offline validation. **It is not acceptable for a real manager**:
-state carries the full security posture of the estate and needs encryption at
-rest, locking, and access limited to the pipeline identity.
+initialise for offline validation. **It is not acceptable for a real manager.**
 
-Replace the block in each stack and fill in `envs/<site>.backend.hcl`. For S3:
+Pick one with a flag rather than editing the stacks by hand:
 
-```hcl
-# stacks/*/backend.tf
-terraform {
-  backend "s3" {}
-}
+```bash
+./scripts/bootstrap.sh --force --backend http      # GitLab-managed state
+./scripts/bootstrap.sh --force --backend s3        # S3, MinIO, Ceph RGW
+./scripts/bootstrap.sh --force --backend azurerm
 ```
+
+Whatever you choose needs three things. The third is the one people skip:
+
+1. **Encryption at rest** — state holds the estate's security posture.
+2. **Access limited to the pipeline identity.**
+3. **Locking.** One state per stack per manager, up to ~50 states across a
+   10-manager estate, with CI running them in parallel. Without locking, a
+   pipeline job and an engineer running the same site at once will corrupt the
+   state file, and Terraform will not warn you.
+
+#### GitLab-managed state — `--backend http`
+
+If you have GitLab, this is the least work: locking, encryption at rest and
+version history come from GitLab, with no object store to run.
 
 ```hcl
 # envs/lon1.backend.hcl
-bucket         = "nsx-tfstate-prod"
-key            = "lon1/local-security.tfstate"
-region         = "eu-west-1"
-dynamodb_table = "nsx-tfstate-lock"
-kms_key_id     = "arn:aws:kms:eu-west-1:...:key/..."
-encrypt        = true
+address        = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security"
+lock_address   = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security/lock"
+unlock_address = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security/lock"
+lock_method    = "POST"
+unlock_method  = "DELETE"
+retry_wait_min = 5
 ```
 
-One state per stack per manager. `scripts/tf.sh` refuses to apply through a
-local backend unless `ALLOW_LOCAL_STATE=1` is set explicitly.
+The state **name** at the end of the address must be unique per stack per
+manager — that is what keeps `lon1-local-security` and `lon1-local-tags` apart.
+
+Credentials never go in that file, because it is committed:
+
+```bash
+export TF_HTTP_USERNAME=gitlab-ci-token
+export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"     # in GitLab CI
+```
+
+Outside CI, use a project access token with the `api` scope, sourced the same
+way NSX credentials are. `make validate` errors if a credential appears in
+`envs/*.hcl`, and errors on an `address` with no `lock_address`.
+
+#### Filesystem state on a server — `--backend local`
+
+Workable for a lab or a single-operator setup, and only with all of:
+
+- **one** runner, and nobody running Terraform from a laptop;
+- a persistent volume that is encrypted and backed up — losing state means
+  Terraform no longer knows it owns anything;
+- filesystem permissions restricting it to the pipeline user.
+
+There is still no locking. `scripts/tf.sh` refuses to apply through it unless
+`ALLOW_LOCAL_STATE=1` is set explicitly, and that guard is deliberate.
+
+#### Not an option: state committed to git
+
+Not to this repository, not to another one, GitLab or otherwise:
+
+- State stores values in **plaintext**, including anything credential-shaped
+  that a provider wrote into it.
+- Git history is **permanent**. Once pushed, removing it means rewriting history
+  everywhere it was cloned.
+- Git has **no locking**. Two runs produce a merge conflict on a binary-ish
+  blob, and resolving it by hand means hand-editing state.
+
+`.gitignore` blocks `*.tfstate` for this reason. GitLab-managed state (above) is
+a different mechanism — an API GitLab hosts, not a file in a repository — and it
+is the right way to keep state in GitLab.
 
 ### 2.2 Credentials — blocking
 

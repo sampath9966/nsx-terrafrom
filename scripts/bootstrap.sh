@@ -27,6 +27,7 @@ DRY_RUN=0
 QUIET=0
 WITH_EXAMPLES=1
 WITH_GIT=0
+BACKEND=local
 
 created=0
 updated=0
@@ -58,6 +59,21 @@ Options:
                       policies, services, network and platform data). The
                       structure, modules, stacks, schemas and tooling are
                       still written.
+      --backend TYPE  State backend written into stacks/*/backend.tf:
+
+                        http     GitLab-managed Terraform state. Locking,
+                                 encryption at rest and versioning come from
+                                 GitLab; credentials from TF_HTTP_USERNAME and
+                                 TF_HTTP_PASSWORD, never from a committed file.
+                        s3       S3 or any S3-compatible object store (MinIO,
+                                 Ceph) with DynamoDB or native locking.
+                        azurerm  Azure blob storage.
+                        local    Filesystem state on this server. NO LOCKING.
+                                 The default, and the placeholder: it exists so
+                                 the stacks initialise for offline validation.
+
+                      Whatever you choose, state carries the full security
+                      posture of the estate. Never commit it to git.
       --git-init      Run 'git init' in the target directory if it is not
                       already inside a git working tree.
   -n, --dry-run       Report what would be written; change nothing.
@@ -106,6 +122,15 @@ while [ $# -gt 0 ]; do
 		WITH_EXAMPLES=0
 		shift
 		;;
+	--backend)
+		[ $# -ge 2 ] || die "--backend requires a type"
+		BACKEND="$2"
+		shift 2
+		;;
+	--backend=*)
+		BACKEND="${1#*=}"
+		shift
+		;;
 	--git-init)
 		WITH_GIT=1
 		shift
@@ -129,6 +154,11 @@ while [ $# -gt 0 ]; do
 	*) die "unknown option: $1 (try --help)" ;;
 	esac
 done
+
+case "$BACKEND" in
+local | http | s3 | azurerm) ;;
+*) die "unknown backend: $BACKEND (expected one of: local, http, s3, azurerm)" ;;
+esac
 
 if [ ! -d "$ROOT" ]; then
 	if [ "$DRY_RUN" = 1 ]; then
@@ -657,8 +687,10 @@ Then, in order:
 
 1. Replace `inventory/managers.yaml` — everything derives from it.
 2. Add one `envs/<site>.backend.hcl` per manager.
-3. **Decide the state backend** and replace the placeholder in `stacks/*/backend.tf`.
-   The local backend is not acceptable for a real manager.
+3. **Decide the state backend.** The default is a placeholder `backend "local"`,
+   which has no locking and is not acceptable for a real manager. Pick one with
+   `scripts/bootstrap.sh --force --backend http|s3|azurerm` — `http` is
+   GitLab-managed state — then fill in `envs/<site>.backend.hcl`.
 4. `terraform init` in one stack and commit the `.terraform.lock.hcl`.
 5. Adopt what already exists: `make import SITE=<site>`, per `docs/IMPORT.md`.
 
@@ -2446,7 +2478,70 @@ SCAFFOLD_EOF
 }
 
 gen_backend() {
-	write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
+	case "$BACKEND" in
+	http)
+		write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
+# Partial backend configuration. Values come from envs/<site>.backend.hcl:
+#
+#   terraform init -backend-config=../../envs/${SITE}.backend.hcl
+#
+# GitLab-managed Terraform state. GitLab provides locking, encryption at rest
+# and version history, so this satisfies what section 9 requires of a backend
+# without standing up an object store.
+#
+# CREDENTIALS DO NOT GO IN THE .hcl FILE. envs/*.backend.hcl is committed, so
+# the token would be committed with it. Terraform reads them from the
+# environment instead:
+#
+#   export TF_HTTP_USERNAME=gitlab-ci-token
+#   export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"     # in GitLab CI
+#
+# Outside CI use a personal or project access token with the api scope, sourced
+# the same way the NSX credentials are — never written to disk.
+
+terraform {
+  backend "http" {}
+}
+SCAFFOLD_EOF
+		;;
+	s3)
+		write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
+# Partial backend configuration. Values come from envs/<site>.backend.hcl:
+#
+#   terraform init -backend-config=../../envs/${SITE}.backend.hcl
+#
+# S3 or an S3-compatible store (MinIO, Ceph RGW). The bucket must have
+# versioning and encryption enabled, and locking must be configured — either a
+# DynamoDB table or the provider's native lock support. State without locking is
+# state that two concurrent runs will corrupt.
+#
+# Credentials come from the environment or an instance role, never from this
+# file: envs/*.backend.hcl is committed.
+
+terraform {
+  backend "s3" {}
+}
+SCAFFOLD_EOF
+		;;
+	azurerm)
+		write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
+# Partial backend configuration. Values come from envs/<site>.backend.hcl:
+#
+#   terraform init -backend-config=../../envs/${SITE}.backend.hcl
+#
+# Azure blob storage. The container must have soft delete and versioning
+# enabled; blob leases provide the locking.
+#
+# Credentials come from the environment or a managed identity, never from this
+# file: envs/*.backend.hcl is committed.
+
+terraform {
+  backend "azurerm" {}
+}
+SCAFFOLD_EOF
+		;;
+	*)
+		write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
 # Partial backend configuration. Values come from envs/<site>.backend.hcl:
 #
 #   terraform init -backend-config=../../envs/${SITE}.backend.hcl
@@ -2455,23 +2550,31 @@ gen_backend() {
 # and has not been made. Until it is, this is the local backend so the stack
 # initialises out of the box for validation and dry runs.
 #
-# The local backend is NOT acceptable for a real manager: state carries the full
-# security posture of the estate and needs encryption at rest, locking, and
-# access restricted to the pipeline identity. scripts/tf.sh refuses to apply
-# through a local backend unless ALLOW_LOCAL_STATE=1 is set explicitly.
+# The local backend is NOT acceptable for a real manager. Two reasons, and the
+# second is the one that bites:
 #
-# Replace the block below with the chosen backend and update
-# envs/*.backend.hcl to match. Example for s3:
+#   * State carries the full security posture of the estate, so it needs
+#     encryption at rest and access restricted to the pipeline identity.
+#   * The local backend HAS NO LOCKING. Two runs against one site at the same
+#     time — a pipeline and an engineer, or two pipeline jobs — will corrupt the
+#     state file, and Terraform will not warn you.
 #
-#   backend "s3" {}
+# scripts/tf.sh refuses to apply through it unless ALLOW_LOCAL_STATE=1 is set.
 #
-# with envs/lon1.backend.hcl supplying bucket / key / region / dynamodb_table /
-# kms_key_id.
+# Regenerate with the backend you want rather than editing this by hand:
+#
+#   scripts/bootstrap.sh --force --backend http      # GitLab-managed state
+#   scripts/bootstrap.sh --force --backend s3        # S3 or MinIO/Ceph
+#   scripts/bootstrap.sh --force --backend azurerm
+#
+# and fill in envs/<site>.backend.hcl to match.
 
 terraform {
   backend "local" {}
 }
 SCAFFOLD_EOF
+		;;
+	esac
 }
 
 for s in global-security local-security local-network platform local-tags; do
@@ -4380,6 +4483,53 @@ def check_policies(
                 report.warn(where, f"{label}: neither source nor destination is set — this matches everything in scope.")
 
 
+BACKEND_SECRET = re.compile(
+    r"^\s*(password|token|secret_key|access_key|secret_access_key|client_secret"
+    r"|sas_token|shared_access_key|tf_http_password)\s*=",
+    re.IGNORECASE,
+)
+
+
+def check_env_backends(report: Report) -> None:
+    """envs/*.backend.hcl is committed, so a backend credential in it is a leak.
+
+    The HTTP backend makes this easy to get wrong — the GitLab token is just
+    another key in the same file as the address. It belongs in TF_HTTP_PASSWORD.
+    """
+    directory = REPO_ROOT / "envs"
+    if not directory.is_dir():
+        return
+
+    for path in sorted(directory.glob("*.hcl")):
+        where = _rel(path)
+        try:
+            lines = path.read_text().splitlines()
+        except OSError as exc:
+            report.error(where, f"unreadable: {exc}")
+            continue
+
+        body = [ln for ln in lines if not ln.lstrip().startswith("#")]
+
+        for i, line in enumerate(body, 1):
+            if BACKEND_SECRET.match(line):
+                key = line.split("=", 1)[0].strip()
+                report.error(
+                    where,
+                    f"{key!r} is a backend credential and this file is committed. "
+                    "Pass it through the environment instead — TF_HTTP_PASSWORD for the "
+                    "http backend, the provider's own variables or an instance role for "
+                    "the object stores.",
+                )
+
+        joined = "\n".join(body)
+        if "address" in joined and "lock_address" not in joined:
+            report.error(
+                where,
+                "http backend with no lock_address. Without it Terraform does not lock, "
+                "and two concurrent runs against this site will corrupt the state.",
+            )
+
+
 def check_vm_tags(scopes: dict, sites: set[str], report: Report) -> int:
     """VM tag assignments, the one place this repository writes tags itself.
 
@@ -4544,6 +4694,7 @@ def main() -> int:
     services = check_services(service_docs, imported, report)
     check_policies(policy_docs, groups, services, sites, imported, report)
     tagged_vms = check_vm_tags(scopes, sites, report)
+    check_env_backends(report)
     check_site_files("network", "network.schema.json", scopes, sites, report)
     check_site_files("platform", "platform.schema.json", scopes, sites, report)
 
@@ -5676,15 +5827,39 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 #
 #   terraform init -backend-config=envs/<site>.backend.hcl
 #
-# The backend type is an open decision (docs/ARCHITECTURE.md section 14.1). Whatever is
-# chosen must give: encryption at rest, state locking, and access restricted to
-# the pipeline identity. State carries the full security posture of the estate.
+# Whatever backend is chosen must give three things: encryption at rest, state
+# LOCKING, and access restricted to the pipeline identity. State carries the
+# full security posture of the estate.
+#
+# NEVER PUT A SECRET IN THIS FILE. It is committed. Backend credentials come
+# from the environment — see each example below.
+#
+# NEVER COMMIT THE STATE ITSELF. Not to this repository, not to another one.
+# State holds every rule, group and credential-shaped value in plaintext; git
+# history is permanent and cannot be pruned once pushed, and git gives you no
+# locking, so two concurrent runs silently diverge. .gitignore blocks *.tfstate
+# for this reason.
+#
+# Pick the backend with: scripts/bootstrap.sh --force --backend TYPE
 
-# While the stacks are on the placeholder local backend this file holds nothing:
-# scripts/tf.sh supplies the state path itself, so two stacks at the same site
-# cannot collide on one state file.
+# --- example: http — GitLab-managed Terraform state ------------------------
+# Locking, encryption at rest and version history come from GitLab, with no
+# object store to run. One state per stack per manager, so the state NAME at the
+# end of the address must be unique per pair.
+#
+# address        = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security"
+# lock_address   = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security/lock"
+# unlock_address = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security/lock"
+# lock_method    = "POST"
+# unlock_method  = "DELETE"
+# retry_wait_min = 5
+#
+# Credentials from the environment, never here:
+#   export TF_HTTP_USERNAME=gitlab-ci-token
+#   export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"
+# Outside CI, a project access token with the api scope in place of the job token.
 
-# --- example: s3 (replace backend "local" with backend "s3" in the stack) ---
+# --- example: s3 (also MinIO or Ceph RGW, with endpoint set) ---------------
 # bucket         = "nsx-terraform-state"
 # key            = "example/global-security.tfstate"
 # region         = "eu-west-2"
@@ -5697,6 +5872,11 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 # storage_account_name = "sttfstatensx"
 # container_name       = "state"
 # key                  = "example/global-security.tfstate"
+
+# --- local backend ---------------------------------------------------------
+# Holds nothing: scripts/tf.sh supplies the state path itself, so two stacks at
+# the same site cannot collide on one file. Filesystem state has NO LOCKING —
+# acceptable for a lab, not for a managed estate.
 SCAFFOLD_EOF
 
 write_file .github/workflows/validate.yml <<'SCAFFOLD_EOF'

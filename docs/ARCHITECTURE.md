@@ -809,10 +809,24 @@ keep it a **separate stack tier with its own state and its own pipeline**:
 These need the owner's call. Do not assume an answer — ask.
 
 1. **State backend** — which backend, where, and how is encryption and locking
-   configured per site? *Unresolved.* `stacks/*/backend.tf` currently holds a
+   configured per site? *Unresolved.* `stacks/*/backend.tf` defaults to a
    placeholder `backend "local"` so the stacks initialise for offline
-   validation; `scripts/tf.sh` blocks apply through it. Replace the block and
-   fill in `envs/*.backend.hcl` once decided.
+   validation; `scripts/tf.sh` blocks apply through it.
+
+   `scripts/bootstrap.sh --force --backend http|s3|azurerm|local` writes the
+   chosen one; then fill in `envs/*.backend.hcl`. `http` is GitLab-managed
+   Terraform state, which supplies locking, encryption at rest and version
+   history with no object store to run — the least-effort option for a GitLab
+   estate. `docs/SETUP.md` section 2.1 covers each.
+
+   Three requirements, and the third is the one that gets skipped: encryption at
+   rest, access limited to the pipeline identity, and **locking**. Up to ~50
+   states across a 10-manager estate, planned in parallel by CI, means an
+   unlocked backend will eventually be written by two runs at once. Filesystem
+   state has no locking; state committed to a git repository has no locking
+   *and* is plaintext in permanent history — `.gitignore` blocks `*.tfstate`.
+   `make validate` errors on a credential in `envs/*.hcl` and on an `address`
+   with no `lock_address`.
 2. **Vault layout** — auth method for the pipeline, mount and path convention,
    static KV vs dynamic secrets. *Unresolved.* `scripts/with-credentials.sh`
    assumes KV v2 at the full path recorded per manager in the inventory.
@@ -885,6 +899,7 @@ scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
 scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
+scripts/bootstrap.sh --backend TYPE   # http (GitLab) | s3 | azurerm | local
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
 
