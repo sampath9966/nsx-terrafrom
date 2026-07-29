@@ -29,8 +29,8 @@ how to keep that from destabilizing the NSX layer.
 schemas, tooling, CI, and worked example data — into whatever directory it is
 run in. Everything it writes has been checked offline:
 
-- `terraform fmt -check` is clean and all four stacks pass `terraform validate`
-  against the real `vmware/nsxt` provider.
+- `terraform fmt -check` is clean and all five stacks pass `terraform validate`
+  against the real `vmware/nsxt` provider (3.12.0, resolved from `~> 3.9`).
 - The data → module wiring evaluates: group and policy filtering by owner and
   site was confirmed with `terraform console`.
 - `scripts/validate-data.py` passes on the example data and was tested against
@@ -70,10 +70,12 @@ irreversible or outage-causing, so they come before the pleasant parts.
    `for_each` over a map with stable string keys. With `count`, inserting a
    rule in the middle shifts every index below it and Terraform destroys and
    recreates every downstream rule — on a DFW that is a live traffic outage.
-2. **Never manage per-VM tags in Terraform at scale.** See section 7 —
-   `nsxt_policy_vm_tags` takes ownership of a VM's *entire* tag set and will
-   fight any other tagger. Terraform owns groups and policies; something else
-   owns VM tags.
+2. **Never manage per-VM tags in Terraform at scale, or alongside another
+   tagger.** `nsxt_policy_vm_tags` takes ownership of a VM's *entire* tag set,
+   so it will fight VCF automation or a CMDB and lose slowly. `data/vm-tags/` is
+   for bounded sets of VMs that nothing else tags; at estate scale, tags come
+   from the provisioning system and this repository consumes them. Sections 7
+   and `docs/TAGGING.md`.
 3. **Never pass a secret through a Terraform data source.** The `vault_*` data
    sources write the fetched secret into state in plaintext. Credentials enter
    the process as environment variables set by the pipeline. See section 9.
@@ -188,6 +190,7 @@ data/
   services/                # reusable service definitions
   network/                 # per-site segments and T1s        (local-network)
   platform/                # per-site T0s and below           (platform)
+  vm-tags/                 # per-site VM tag assignments      (local-tags)
   schema/                  # JSON Schema for everything in data/, enforced in CI
                            # plus tag-scopes.yaml, the tag vocabulary
 modules/
@@ -195,11 +198,13 @@ modules/
   group/                   # group with tag criteria
   service/                 # custom L4/ICMP services
   segment/
+  vm-tags/                 # VM tags, where Terraform is the only tagger
   tier1/
   tier0/
 stacks/
   global-security/         # GM: federated DFW. One state.
   local-security/          # per-LM: local-only DFW. One state per LM.
+  local-tags/              # per-LM: VM tags. One state per LM.
   local-network/           # per-LM: segments, T1s. One state per LM.
   platform/                # per-LM: T0, transport zones, edge clusters.
 envs/
@@ -221,12 +226,19 @@ State boundaries follow **change cadence and blast radius**, not just topology:
 |---|---|---|---|
 | `global-security` | daily | all sites | security review |
 | `local-security` | weekly | one site | site owner |
+| `local-tags` | daily | the VMs listed | site owner |
 | `local-network` | weekly | one site | network owner |
 | `platform` | rarely | one site, total | change advisory |
 
 A daily DFW rule edit must never require Terraform to refresh transport zones.
 Refresh cost is per-state, and the platform layer is the slowest and the most
 dangerous thing in the estate.
+
+`local-tags` is split from `local-security` on the same grounds: tagging churns
+daily and its blast radius is the listed VMs, so sharing a state would make
+every tag edit refresh every policy. The two need no Terraform dependency — NSX
+evaluates dynamic membership server-side, so a tag lands and group membership
+follows without `local-security` running.
 
 ### Addressing 10+ managers without alias sprawl
 
@@ -398,17 +410,39 @@ report drift forever.
 
 **Therefore: Terraform does not tag VMs at scale in this repository.**
 
-- **Tags are applied at the source of truth** — VM provisioning, VCF/vRA
-  automation, or the CMDB sync. That system owns them.
-- **Terraform owns groups and policies**, which *consume* those tags through
-  dynamic criteria.
-- `nsxt_policy_vm_tags` is reserved for a small, explicitly listed set of
-  exceptions where Terraform is the sole tagger — typically quarantine. Each
-  use is justified in a comment naming why no other system tags that VM.
-
 Beyond correctness, this is a scale decision: a `nsxt_policy_vm_tags` resource
 per VM across 10+ managers means tens of thousands of state entries and refresh
 times that make daily changes impossible.
+
+That leaves two supported arrangements. **`docs/TAGGING.md` is the full
+treatment**; the summary is:
+
+| | Variant A — *default* | Variant B |
+|---|---|---|
+| Who tags | VCF/vRA automation, CMDB sync, provisioning | this repository |
+| Where | the source of truth | `data/vm-tags/<site>.yaml` |
+| Applied by | that system | `stacks/local-tags` |
+| Good for | the estate | bounded exception sets |
+| Ceiling | none | a few hundred VMs |
+
+- **Variant A**: tags are applied at the source of truth, and Terraform owns
+  groups and policies which *consume* them through dynamic criteria. This
+  repository still owns the vocabulary those tags must use.
+- **Variant B**: for VMs that nothing else tags — hand-built servers,
+  appliances, workloads not onboarded to a CMDB, and quarantine. Engineers tag
+  through `make tag-vm`, review it as a data change, and never open the NSX UI.
+
+**Neither variant requires the NSX UI.** The choice is which system is the
+source of truth, not whether tagging is automated.
+
+The boundary is enforced, not documented: every scope in
+`data/schema/tag-scopes.yaml` records the system that owns it, and
+`make validate` **errors** if `data/vm-tags/` writes a scope whose owner is not
+`terraform`. Moving a scope across that line is a reviewed change, and the
+review question is the right one — *are we certain nothing else tags these VMs?*
+
+Mixing is per **VM**, never per tag: a VM is wholly Terraform-tagged or it is
+not. The resource has no per-tag ownership, so there is no half.
 
 Segment tags are different — segments are Terraform-owned infrastructure, so
 tagging them inline in the `nsxt_policy_segment` resource is correct and
@@ -775,10 +809,24 @@ keep it a **separate stack tier with its own state and its own pipeline**:
 These need the owner's call. Do not assume an answer — ask.
 
 1. **State backend** — which backend, where, and how is encryption and locking
-   configured per site? *Unresolved.* `stacks/*/backend.tf` currently holds a
+   configured per site? *Unresolved.* `stacks/*/backend.tf` defaults to a
    placeholder `backend "local"` so the stacks initialise for offline
-   validation; `scripts/tf.sh` blocks apply through it. Replace the block and
-   fill in `envs/*.backend.hcl` once decided.
+   validation; `scripts/tf.sh` blocks apply through it.
+
+   `scripts/bootstrap.sh --force --backend gitlab|s3|azure|local` writes the
+   chosen one; then fill in `envs/*.backend.hcl`. `http` is GitLab-managed
+   Terraform state, which supplies locking, encryption at rest and version
+   history with no object store to run — the least-effort option for a GitLab
+   estate. `docs/SETUP.md` section 2.1 covers each.
+
+   Three requirements, and the third is the one that gets skipped: encryption at
+   rest, access limited to the pipeline identity, and **locking**. Up to ~50
+   states across a 10-manager estate, planned in parallel by CI, means an
+   unlocked backend will eventually be written by two runs at once. Filesystem
+   state has no locking; state committed to a git repository has no locking
+   *and* is plaintext in permanent history — `.gitignore` blocks `*.tfstate`.
+   `make validate` errors on a credential in `envs/*.hcl` and on an `address`
+   with no `lock_address`.
 2. **Vault layout** — auth method for the pipeline, mount and path convention,
    static KV vs dynamic secrets. *Unresolved.* `scripts/with-credentials.sh`
    assumes KV v2 at the full path recorded per manager in the inventory.
@@ -823,6 +871,17 @@ These need the owner's call. Do not assume an answer — ask.
   the commit subjects and the PR body.
 - **PRs**: open as drafts until ready. One site or one application per PR — a PR
   spanning multiple sites cannot be rolled back cleanly.
+- **Attribution**: every commit is authored *and* committed by the repository
+  owner. No co-author trailers for tooling, and no generated-by footers in pull
+  request bodies. `GIT_AUTHOR_*` and `GIT_COMMITTER_*` outrank `git config` and
+  hosted environments do set them, so check the history rather than the config.
+  This should print nothing — the owner is the only identity in the history,
+  bar `GitHub <noreply@github.com>` on commits created through the web UI:
+
+  ```bash
+  git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u \
+    | grep -vE 'sampath|^GitHub <noreply@github\.com>$'
+  ```
 
 ## 16. Tooling
 
@@ -840,6 +899,7 @@ scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
 scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
+scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
 
@@ -864,6 +924,8 @@ make fmt               # terraform fmt -recursive .
 make fmt-check         # fail if anything is unformatted
 make matrix            # print the CI matrix from inventory/managers.yaml
 make add-rule POLICY=prod-payments RULE=allow-x ARGS='--source a --destination b --scope b'
+make tag-vm SITE=lon1 VM=payments-web-01 ARGS='--set workload=payments-web'
+make tags SITE=lon1                        # what is tagged from Terraform at this site
 make import SITE=lon1                      # adopt a live estate (DUMP=file to convert offline)
 make drift STACK=local-security SITE=lon1  # report drift; never reverts, never writes data/
 make init  STACK=global-security SITE=gm1
@@ -884,6 +946,7 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
 | `scripts/preflight.sh` | Reports missing tools. Read-only. |
 | `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
+| `scripts/tag-vm.py --site S --vm V --set SCOPE=VALUE` | Tags a VM as a data edit on `data/vm-tags/<site>.yaml`. Also `--unset SCOPE`, `--remove`, `--list`, `--dry-run`. Refuses any scope not owned by `terraform` in the vocabulary, and refuses to leave a VM with an empty tag set. |
 | `scripts/import-estate.py --site S [--from-dump F]` | Adopts a live estate: data files, Terraform import blocks, and the import manifest. `--dump-only` captures without converting. Never overwrites — writes `<name>.new` instead. |
 | `scripts/drift.sh STACK SITE` | Refresh-only plan, report to `reports/`. Exit 2 on drift. Never reverts, never writes `data/`. |
 
