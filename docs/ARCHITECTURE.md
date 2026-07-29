@@ -284,6 +284,39 @@ Rules for keeping the boundary intact:
 
 ## 6. DFW policies and rules
 
+### A policy is reused, never recreated
+
+A new rule for policy X goes **into policy X**. It never justifies a second
+policy X.
+
+This sounds obvious and is the most common way these repositories go wrong: two
+data files describe the same policy, so NSX ends up with two policies of the
+same name and different `nsx_id`s, in the same category, with overlapping
+sequence numbers. Traffic then matches whichever won the ordering, and the rule
+someone added appears to do nothing.
+
+Three mechanisms enforce it, so it does not rest on anybody remembering:
+
+1. **Look it up first.** `scripts/add-rule.py --policy <id-or-name>` searches
+   every file in `data/policies/`, appends to the one that already holds the
+   policy, and allocates the next free sequence number. A policy it cannot find
+   is an error listing what does exist — creating one requires an explicit
+   `--create-policy`, because a new policy means a new category placement, a new
+   ordering and a new blast radius.
+2. **Duplicates fail validation.** `make validate` errors when two data files
+   declare the same policy name, category, owner and span, even under different
+   ids, and names the file that already has it.
+3. **The resource cannot be destroyed by a routine change.** The parent policy
+   carries `prevent_destroy = true`. Nothing in an ordinary data edit can drop a
+   policy and rebuild it — including the silent replacements, since changing
+   `category` or `domain` forces a new policy and would take every rule with it.
+   Retiring a policy means removing that line in a reviewed commit: deliberate
+   friction, because policy deletion is not routine.
+
+The same principle is what makes import work — an imported policy keeps its real
+`nsx_id`, so Terraform writes new rules into the policy you already run rather
+than building a parallel one.
+
 ### Use the parent-policy + standalone-rule pattern
 
 For any policy with **daily churn**, use:
@@ -653,26 +686,50 @@ from automation.
 
 The estate exists already. This repository will not start from an empty NSX.
 
-### Import
-
-Use Terraform `import` blocks with config generation rather than hand-writing
-resources to match reality:
-
-```hcl
-import {
-  to = nsxt_policy_group.app_web
-  id = "/infra/domains/default/groups/prod-payments-web"
-}
-```
+**`docs/IMPORT.md` is the step-by-step walkthrough.** The short version:
 
 ```bash
-terraform plan -generate-config-out=generated.tf
+# 1. capture (read-only; reports/ is gitignored)
+scripts/with-credentials.sh lon1 -- scripts/import-estate.py \
+    --site lon1 --dump-only reports/lon1-raw.json
+
+# 2. convert to data files + import blocks
+scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
+
+# 3. verify, then import one tranche
+make validate
+scripts/with-credentials.sh lon1 -- scripts/tf.sh plan local-security lon1
 ```
 
-NSX policy resources import by **policy path**. Import in tranches: one policy
-or one site at a time, and confirm a clean no-op plan before moving on. A
-tranche is done when `terraform plan` reports no changes — not when it applies
-cleanly.
+The principle is **adopt, never recreate**. `scripts/import-estate.py` reads
+groups, policies, rules and services from the manager and writes them out as
+data plus Terraform `import` blocks, adopting each object's real `nsx_id`
+verbatim — mixed case and underscores included, because the key must match or
+the import misses and Terraform builds a duplicate beside the original. The
+naming convention in section 15 governs objects created from here on; the
+validator reads `data/.import-manifest.json` and knows the difference.
+
+Import in tranches: one policy or one site at a time. A tranche is done when
+`terraform plan` reports **no changes** — not when it applies cleanly. A
+*create* in an import plan means Terraform did not recognise something that
+exists; stop rather than apply, or you get the duplicate the whole exercise is
+meant to avoid.
+
+The import id format has varied across provider versions. The converter emits
+`path` by default and can emit `domain-id` or `id`; a wrong choice fails at plan
+time before anything reaches state, so confirm it on the pilot.
+
+### Imported data is yours, and nothing overwrites it
+
+Enforced, not just documented:
+
+- `bootstrap.sh --force` refreshes its own output — modules, stacks, scripts, CI
+  — and **never** touches `data/`, `inventory/` or `envs/`. `--force-data` is
+  needed for those, and it still refuses outright for any file recorded in
+  `data/.import-manifest.json`.
+- Re-running the importer over an existing file writes `<name>.new` beside it
+  and leaves yours alone.
+- Drift detection is strictly read-only (below).
 
 ### Drift
 
@@ -680,7 +737,10 @@ Administrators will make UI changes, especially during incidents. Expect it.
 
 - Run a **scheduled plan** per stack and report drift; do not auto-revert. An
   auto-revert during an active incident undoes the fix someone applied to stop
-  an outage.
+  an outage. `scripts/drift.sh` does exactly this and no more: a refresh-only
+  plan, a report in `reports/`, exit code 2 when something diverged. It never
+  reverts, and it never writes back into `data/` — a tool that rewrote your data
+  files on a drift signal would silently overwrite the estate you imported.
 - Treat detected drift as a ticket: either bring the change into code or revert
   it deliberately.
 - Use `lifecycle.ignore_changes` sparingly and always with a comment naming the
@@ -777,7 +837,8 @@ aspirational.
 scripts/bootstrap.sh                  # scaffold into the current directory
 scripts/bootstrap.sh --dir PATH       # scaffold somewhere else
 scripts/bootstrap.sh --dry-run        # report what would be written
-scripts/bootstrap.sh --force          # overwrite files that already differ
+scripts/bootstrap.sh --force          # refresh regenerated files only
+scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
@@ -785,6 +846,12 @@ scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 Self-contained: no network, no dependency on the repository it came from, bash
 and coreutils only. Idempotent — an unchanged file is left alone, an edited one
 is kept and reported (exit 2) unless `--force`. It never deletes anything.
+
+**`--force` cannot touch your estate.** It refreshes this script's own output —
+modules, stacks, scripts, schemas, CI, docs — and leaves `data/`, `inventory/`
+and `envs/` alone. Overwriting those needs `--force-data`, which still refuses
+outright for anything recorded in `data/.import-manifest.json`. Imported estate
+is never overwritten by this script, by any flag.
 
 ### Make targets
 
@@ -796,6 +863,9 @@ make schema-validate   # data/ and inventory/ only
 make fmt               # terraform fmt -recursive .
 make fmt-check         # fail if anything is unformatted
 make matrix            # print the CI matrix from inventory/managers.yaml
+make add-rule POLICY=prod-payments RULE=allow-x ARGS='--source a --destination b --scope b'
+make import SITE=lon1                      # adopt a live estate (DUMP=file to convert offline)
+make drift STACK=local-security SITE=lon1  # report drift; never reverts, never writes data/
 make init  STACK=global-security SITE=gm1
 make plan  STACK=global-security SITE=gm1
 make show  STACK=global-security SITE=gm1
@@ -813,6 +883,9 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/tf.sh init\|plan\|show\|apply STACK SITE` | Terraform for one stack against one manager. `-parallelism=5`; override with `PARALLELISM`. |
 | `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
 | `scripts/preflight.sh` | Reports missing tools. Read-only. |
+| `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
+| `scripts/import-estate.py --site S [--from-dump F]` | Adopts a live estate: data files, Terraform import blocks, and the import manifest. `--dump-only` captures without converting. Never overwrites — writes `<name>.new` instead. |
+| `scripts/drift.sh STACK SITE` | Refresh-only plan, report to `reports/`. Exit 2 on drift. Never reverts, never writes `data/`. |
 
 `scripts/validate-data.py` and `scripts/ci-matrix.py` need only Python 3.9+;
 PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
