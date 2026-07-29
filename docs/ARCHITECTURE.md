@@ -823,6 +823,17 @@ These need the owner's call. Do not assume an answer — ask.
   the commit subjects and the PR body.
 - **PRs**: open as drafts until ready. One site or one application per PR — a PR
   spanning multiple sites cannot be rolled back cleanly.
+- **Attribution**: every commit is authored *and* committed by the repository
+  owner. No co-author trailers for tooling, and no generated-by footers in pull
+  request bodies. `GIT_AUTHOR_*` and `GIT_COMMITTER_*` outrank `git config` and
+  hosted environments do set them, so check the history rather than the config.
+  This should print nothing — the owner is the only identity in the history,
+  bar `GitHub <noreply@github.com>` on commits created through the web UI:
+
+  ```bash
+  git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u \
+    | grep -vE 'sampath|^GitHub <noreply@github\.com>$'
+  ```
 
 ## 16. Tooling
 
