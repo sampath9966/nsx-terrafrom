@@ -155,7 +155,28 @@ while [ $# -gt 0 ]; do
 		printf 'bootstrap.sh %s\n' "$VERSION"
 		exit 0
 		;;
-	*) die "unknown option: $1 (try --help)" ;;
+	*)
+		# Editors, chat clients and word processors substitute an em- or
+		# en-dash for a double hyphen when you copy a command out of them.
+		# The result looks almost identical and is a different byte sequence.
+		# Strip the exact dash rather than one character: these are multibyte,
+		# and ${1#?} would leave the remaining bytes behind.
+		bare=""
+		case "$1" in
+		—*) bare="${1#—}" ;;
+		–*) bare="${1#–}" ;;
+		―*) bare="${1#―}" ;;
+		‐*) bare="${1#‐}" ;;
+		‑*) bare="${1#‑}" ;;
+		−*) bare="${1#−}" ;;
+		esac
+		if [ -n "$bare" ]; then
+			die "unknown option: $1
+       That leading character is a dash, not two hyphens. Something between the
+       command and your shell substituted it — editors and chat clients do this
+       silently when you copy a command. Retype it as:  --$bare"
+		fi
+		die "unknown option: $1 (try --help)" ;;
 	esac
 done
 
