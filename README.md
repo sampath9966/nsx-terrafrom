@@ -89,18 +89,83 @@ never force Terraform to refresh transport zones.
 Adding an eleventh Local Manager is a data change in `inventory/managers.yaml`,
 not a code change: CI derives its run matrix from there.
 
+## Re-running the generator is safe
+
+The case that matters is day two: months in, the tree is full of your work, and
+somebody re-runs the generator to pick up an update.
+
+**With no flag, nothing that already exists is ever overwritten.** Differing
+files are kept and reported, and the run exits `2`. Missing files are still
+added, so this is the safe way to take additions.
+
+**Overwriting takes a flag *and* a typed phrase.** `--force` alone does not do
+it — the first file that would be overwritten stops the run and asks you to type
+`wipe everything & start fresh` in full. Anything else aborts with nothing
+changed. The prompt states whether estate data is in scope.
+
+Three things hold in every mode: it **never deletes**; imported estate recorded
+in `data/.import-manifest.json` is **never** overwritten, flag and phrase or not;
+and without a terminal an overwrite **aborts** instead of proceeding (pipelines
+pass `--confirm 'wipe everything & start fresh'` deliberately).
+
+| Command | Overwrites |
+|---|---|
+| *(no flag)* | nothing — differing files kept, exit 2 |
+| `--force` | generator output only: modules, stacks, scripts, schemas, CI, docs |
+| `--force-data` | the above **and** `data/`, `inventory/`, `envs/` |
+
+Details in [`docs/SETUP.md`](docs/SETUP.md#re-running-it-later--day-two).
+
+## Documentation
+
+Two documents live here. The rest are written into the tree the generator
+creates, because they describe that tree.
+
+### In this repository
+
+| Document | Read it for |
+|---|---|
+| **[`README.md`](README.md)** *(this file)* | What this is, what it produces, and current status. Start here. |
+| **[`docs/SETUP.md`](docs/SETUP.md)** | Standing up your own, end to end: prerequisites, generating, the decisions that are yours, greenfield vs brownfield, first contact with a manager, daily use, troubleshooting. |
+| **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** | The design and the operating rules — 16 sections. The reference, not the tutorial. Copied into every generated tree. |
+
+### Written into the generated tree
+
+| Document | Read it for |
+|---|---|
+| `README.md` | Orientation for whoever opens that repository. |
+| `docs/ARCHITECTURE.md` | The same reference, carried across so its links resolve. |
+| `docs/STRUCTURE.md` | What each directory is for, and what must *not* go in it. |
+| `docs/TAGGING.md` | Who applies tags — the two variants, the ownership constraint, and how the boundary is enforced. |
+| `docs/IMPORT.md` | Adopting an estate that already exists: the tranche workflow. |
+| `modules/*/README.md` | Input shape and gotchas, one per module. |
+| `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
+| `inventory/README.md` | How the manager registry drives everything else. |
+
+### Where to start, by question
+
+| You want to | Go to |
+|---|---|
+| Understand what this is | this README |
+| Stand one up | `docs/SETUP.md` |
+| Know why it is built this way | `docs/ARCHITECTURE.md` §1–§9 |
+| Avoid breaking a live firewall | `docs/ARCHITECTURE.md` §2 — ten failure modes |
+| Add a firewall rule | `docs/ARCHITECTURE.md` §8, §10 |
+| Decide who tags workloads | `docs/TAGGING.md` |
+| Choose a state backend | `docs/SETUP.md` §2.1 |
+| Adopt an existing estate | `docs/IMPORT.md` |
+| Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
+| Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
+
 ## Repository contents
 
 | Path | What it is |
 |---|---|
 | `scripts/bootstrap.sh` | The generator. Every file it writes is embedded in it. |
-| `docs/ARCHITECTURE.md` | The design, the conventions, and the operating rules. Copied into every generated tree. |
+| `docs/ARCHITECTURE.md` | The design, the conventions, and the operating rules. |
 | `docs/SETUP.md` | How to stand up your own, and the variants on offer. |
+| `README.md` | This file. |
 | `LICENSE` | Apache-2.0. |
-
-`docs/IMPORT.md`, `docs/STRUCTURE.md` and `docs/TAGGING.md` are referenced from
-`docs/ARCHITECTURE.md` but are written by the generator — you will find them in
-the tree it creates, not here.
 
 ## Status — read before acting
 

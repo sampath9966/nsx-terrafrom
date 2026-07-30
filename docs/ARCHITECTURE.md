@@ -898,6 +898,7 @@ scripts/bootstrap.sh --dir PATH       # scaffold somewhere else
 scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
 scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
+scripts/bootstrap.sh --confirm TEXT   # the overwrite phrase, for a pipeline
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
@@ -907,11 +908,20 @@ Self-contained: no network, no dependency on the repository it came from, bash
 and coreutils only. Idempotent — an unchanged file is left alone, an edited one
 is kept and reported (exit 2) unless `--force`. It never deletes anything.
 
+**Nothing existing is overwritten without a flag AND a typed phrase.** With no
+flag, a file whose content differs is kept and reported and the run exits 2.
+With `--force` or `--force-data`, the first file that would actually be
+overwritten stops the run and asks for `wipe everything & start fresh`, typed in
+full; answering covers the rest of the run, anything else aborts with nothing
+changed. Without a terminal it aborts rather than proceeding — a pipeline passes
+`--confirm` or `BOOTSTRAP_CONFIRM` deliberately. A flag in shell history should
+not be able to revert a tree somebody has spent months editing.
+
 **`--force` cannot touch your estate.** It refreshes this script's own output —
 modules, stacks, scripts, schemas, CI, docs — and leaves `data/`, `inventory/`
 and `envs/` alone. Overwriting those needs `--force-data`, which still refuses
 outright for anything recorded in `data/.import-manifest.json`. Imported estate
-is never overwritten by this script, by any flag.
+is never overwritten by this script, by any flag or phrase.
 
 ### Make targets
 

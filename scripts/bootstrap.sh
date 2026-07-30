@@ -29,6 +29,11 @@ WITH_EXAMPLES=1
 WITH_GIT=0
 BACKEND=local
 
+# Overwriting takes a flag AND this phrase, typed in full. See confirm_overwrite.
+CONFIRM_PHRASE="wipe everything & start fresh"
+CONFIRM_ARG="${BOOTSTRAP_CONFIRM:-}"
+CONFIRMED=0
+
 created=0
 updated=0
 unchanged=0
@@ -55,6 +60,19 @@ Options:
                       Refuses outright for any file recorded in
                       data/.import-manifest.json — imported estate is never
                       overwritten by this script. Implies --force.
+      --confirm TEXT  Supply the overwrite confirmation phrase non-interactively,
+                      for a pipeline. Must match exactly; also read from
+                      BOOTSTRAP_CONFIRM. Without a terminal and without this,
+                      an overwrite aborts rather than proceeding.
+
+WITHOUT A FLAG, NOTHING EXISTING IS EVER OVERWRITTEN. A file that differs from
+what this script would write is kept, reported, and the run exits 2.
+
+WITH --force OR --force-data, the first file that would actually be overwritten
+stops the run and asks you to type a confirmation phrase in full. Answer once
+and it covers the rest of the run; answer wrong and nothing is overwritten. A
+flag in shell history should not be able to revert a tree somebody has spent
+months editing.
       --no-examples   Skip the example data files (inventory entry, groups,
                       policies, services, network and platform data). The
                       structure, modules, stacks, schemas and tooling are
@@ -124,6 +142,15 @@ while [ $# -gt 0 ]; do
 		;;
 	--no-examples)
 		WITH_EXAMPLES=0
+		shift
+		;;
+	--confirm)
+		[ $# -ge 2 ] || die "--confirm requires the phrase"
+		CONFIRM_ARG="$2"
+		shift 2
+		;;
+	--confirm=*)
+		CONFIRM_ARG="${1#*=}"
 		shift
 		;;
 	--backend)
@@ -245,6 +272,80 @@ is_imported() {
 	grep -Fq "\"$1\"" "$MANIFEST" 2>/dev/null
 }
 
+# confirm_overwrite <relative-path>
+#
+# A flag is not consent. On day two this script runs against a tree somebody has
+# been editing for months, and --force in shell history is one arrow-key away
+# from a run that reverts all of it. So the first file that would actually be
+# overwritten stops the run and asks for the phrase, typed in full.
+#
+# Asked once per run: answering covers every remaining file, and nothing has
+# been overwritten before the question. Read from /dev/tty, because write_file
+# takes its content on stdin — a read here would eat the heredoc.
+confirm_overwrite() {
+	[ "$CONFIRMED" = 1 ] && return 0
+
+	local scope
+	if [ "$FORCE_DATA" = 1 ]; then
+		scope="Regenerated files AND ESTATE DATA — data/, inventory/ and envs/, which
+       describe your network. Anything recorded in data/.import-manifest.json is
+       still refused outright."
+	else
+		scope="Regenerated files only — modules, stacks, scripts, schemas, CI, docs.
+       Estate data in data/, inventory/ and envs/ will NOT be touched."
+	fi
+
+	if [ -n "$CONFIRM_ARG" ]; then
+		[ "$CONFIRM_ARG" = "$CONFIRM_PHRASE" ] || die "--confirm does not match. Expected exactly:
+       $CONFIRM_PHRASE
+       Nothing has been overwritten."
+		CONFIRMED=1
+		log ""
+		log "--confirm matched; overwriting existing files for the rest of this run."
+		log ""
+		return 0
+	fi
+
+	# Not [ -r /dev/tty ]: the device node is readable by mode even when there is
+	# no controlling terminal to open. Try the open.
+	if ! { true </dev/tty; } 2>/dev/null; then
+		die "$1 already exists and differs, and this run would overwrite it.
+       There is no terminal to confirm on, so nothing has been changed.
+       In a pipeline, pass the phrase explicitly:
+         --confirm '$CONFIRM_PHRASE'"
+	fi
+
+	{
+		printf '\n'
+		printf '%s\n' "-------------------------------------------------------------------"
+		printf 'About to OVERWRITE files that already exist and differ from what this\n'
+		printf 'script generates. First one found: %s\n' "$1"
+		printf '\n'
+		printf 'Scope: %s\n' "$scope"
+		printf '\n'
+		printf 'This cannot be undone by re-running the script. If the tree is a git\n'
+		printf 'working copy, commit or stash first — that is your undo.\n'
+		printf '%s\n' "-------------------------------------------------------------------"
+		printf '\n'
+		printf 'Type exactly this phrase to continue, or anything else to abort:\n'
+		printf '  %s\n' "$CONFIRM_PHRASE"
+		printf '> '
+	} >&2
+
+	local reply=""
+	IFS= read -r reply </dev/tty || reply=""
+
+	if [ "$reply" != "$CONFIRM_PHRASE" ]; then
+		printf '\n' >&2
+		die "phrase did not match. Nothing has been overwritten."
+	fi
+
+	CONFIRMED=1
+	printf '\n' >&2
+	log "confirmed; overwriting existing files for the rest of this run."
+	log ""
+}
+
 # write_file <relative-path> — content is read from stdin.
 write_file() {
 	local rel="$1"
@@ -287,6 +388,7 @@ write_file() {
 			log "  ok       $rel"
 			unchanged=$((unchanged + 1))
 		elif [ "$may_overwrite" = 1 ]; then
+			confirm_overwrite "$rel"
 			cat "$tmp" >"$dest"
 			log "  updated  $rel"
 			updated=$((updated + 1))
@@ -743,6 +845,54 @@ Then, in order:
 
 Everything under `data/` and `inventory/` ships as realistic example content
 describing no real site. Replace it, or regenerate with `--no-examples`.
+
+## Documentation
+
+| Document | Read it for |
+|---|---|
+| `README.md` *(this file)* | What this repository does and how to start. |
+| `docs/ARCHITECTURE.md` | The design and the operating rules, 16 sections — the reference. **§2 is the ten things that will break this repository.** |
+| `docs/STRUCTURE.md` | What each directory is for, and what must *not* go in it. |
+| `docs/TAGGING.md` | Who applies tags: the two variants, the ownership constraint, how the boundary is enforced. |
+| `docs/IMPORT.md` | Adopting an estate that already exists — the tranche workflow. |
+| `docs/SETUP.md` | Standing this up end to end: prerequisites, the decisions that are yours, backend choice, first contact with a manager. |
+| `modules/*/README.md` | Input shape and gotchas, one per module. |
+| `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
+| `inventory/README.md` | How the manager registry drives everything else. |
+
+By question:
+
+| You want to | Go to |
+|---|---|
+| Add a firewall rule | `docs/ARCHITECTURE.md` §8 and §10 |
+| Avoid breaking a live firewall | `docs/ARCHITECTURE.md` §2 |
+| Decide who tags workloads | `docs/TAGGING.md` |
+| Adopt an existing estate | `docs/IMPORT.md` |
+| Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
+| Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
+
+## Re-running the generator
+
+`scripts/bootstrap.sh` is safe to re-run, and it is how you take updates.
+
+**With no flag it never overwrites anything that already exists.** A file whose
+content differs is kept and reported, the run exits `2`, and files that are
+missing are still added.
+
+**Overwriting takes a flag *and* a typed phrase.** `--force` alone does not do
+it: the first file that would be overwritten stops the run and asks for
+`wipe everything & start fresh`, typed in full. Anything else aborts having
+changed nothing.
+
+| Command | Overwrites |
+|---|---|
+| *(no flag)* | nothing — differing files kept, exit 2 |
+| `--force` | generator output only: modules, stacks, scripts, schemas, CI, docs |
+| `--force-data` | the above **and** `data/`, `inventory/`, `envs/` |
+
+It **never deletes**, and anything recorded in `data/.import-manifest.json` is
+**never** overwritten — flag and phrase or not. Commit before a `--force` run:
+git is the real undo.
 
 ## Before you touch a live manager
 
@@ -6689,17 +6839,20 @@ if [ -f "$SELF" ] && [ "$SELF" != "$ROOT/scripts/bootstrap.sh" ]; then
 	mark_executable scripts/bootstrap.sh
 fi
 
-# ARCHITECTURE.md is the document every generated file points at, and it is too
-# long to embed here — so it is carried across rather than written out. It
-# travels beside the script, so a scaffold generated from a scaffold keeps it.
-if [ -f "$SELF_DIR/../docs/ARCHITECTURE.md" ] &&
-	[ "$SELF_DIR/../docs/ARCHITECTURE.md" != "$ROOT/docs/ARCHITECTURE.md" ]; then
-	write_file docs/ARCHITECTURE.md <"$SELF_DIR/../docs/ARCHITECTURE.md"
-elif [ ! -f "$ROOT/docs/ARCHITECTURE.md" ]; then
-	warn "docs/ARCHITECTURE.md was not found next to this script and has not been written.
-         Every generated file references it. Copy it in from the repository this
+# ARCHITECTURE.md and SETUP.md are referenced throughout the generated tree and
+# are too long to embed here, so they are carried across rather than written out.
+# They travel beside the script, so a scaffold generated from a scaffold keeps
+# them and their cross-references keep resolving.
+for doc in ARCHITECTURE SETUP; do
+	src="$SELF_DIR/../docs/$doc.md"
+	if [ -f "$src" ] && [ "$src" != "$ROOT/docs/$doc.md" ]; then
+		write_file "docs/$doc.md" <"$src"
+	elif [ ! -f "$ROOT/docs/$doc.md" ]; then
+		warn "docs/$doc.md was not found next to this script and has not been written.
+         The generated tree references it. Copy it in from the repository this
          script came from."
-fi
+	fi
+done
 
 if [ "$DRY_RUN" != 1 ]; then
 	for f in $EXECUTABLES; do

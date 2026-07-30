@@ -67,20 +67,67 @@ With examples, replace `inventory/managers.yaml` and everything under `data/`
 before you go near a manager. The example inventory uses `gm1`, `lon1`, `nyc1`,
 `fra1` — if any of those happen to be your real site ids, be especially careful.
 
-### Re-running it later
+### Re-running it later — day two
 
-Safe, and the intended way to take generator updates:
+This is the case that matters. Six months in, the tree is full of your work and
+somebody re-runs the generator to pick up an update. That must not be able to
+revert anything.
+
+**With no flag, nothing that already exists is ever overwritten.** A file whose
+content differs is kept, reported, and the run exits `2`. New files are still
+added, so this is the safe way to pick up additions.
 
 ```bash
-./scripts/bootstrap.sh              # unchanged files untouched, edited files kept (exit 2)
-./scripts/bootstrap.sh --force      # refresh the generator's own output
-./scripts/bootstrap.sh --force-data # ALSO overwrite data/, inventory/, envs/
+./scripts/bootstrap.sh                  # add what is missing, touch nothing else
+./scripts/bootstrap.sh --dry-run        # report only
 ```
 
-It never deletes. `--force` refreshes modules, stacks, scripts, schemas, CI and
-docs, and cannot touch `data/`, `inventory/` or `envs/`. `--force-data` can, but
-still **refuses outright** for anything recorded in `data/.import-manifest.json`
-— adopted estate is never overwritten by this script, by any flag.
+**Overwriting takes a flag *and* a typed phrase.** The flag alone is not enough:
+the first file that would actually be overwritten stops the run and asks.
+
+```
+-------------------------------------------------------------------
+About to OVERWRITE files that already exist and differ from what this
+script generates. First one found: modules/group/main.tf
+
+Scope: Regenerated files only — modules, stacks, scripts, schemas, CI, docs.
+       Estate data in data/, inventory/ and envs/ will NOT be touched.
+
+This cannot be undone by re-running the script. If the tree is a git
+working copy, commit or stash first — that is your undo.
+-------------------------------------------------------------------
+
+Type exactly this phrase to continue, or anything else to abort:
+  wipe everything & start fresh
+>
+```
+
+Answer once and it covers the rest of that run. Anything other than the exact
+phrase aborts with nothing overwritten. The prompt names estate data explicitly
+when `--force-data` widened the scope to it.
+
+| Command | Overwrites |
+|---|---|
+| *(no flag)* | nothing — differing files kept, exit 2 |
+| `--force` | the generator's own output: modules, stacks, scripts, schemas, CI, docs. **Never** `data/`, `inventory/`, `envs/` |
+| `--force-data` | the above **and** estate data. Still refuses anything in `data/.import-manifest.json` |
+
+Three things hold no matter what you pass:
+
+- **It never deletes.** Files you added that the generator knows nothing about
+  are left alone in every mode.
+- **Imported estate is never overwritten.** Anything recorded in
+  `data/.import-manifest.json` is refused outright, flag and phrase or not.
+- **Without a terminal, an overwrite aborts** rather than proceeding. For a
+  pipeline, pass the phrase deliberately:
+
+  ```bash
+  ./scripts/bootstrap.sh --force --confirm 'wipe everything & start fresh'
+  # or BOOTSTRAP_CONFIRM='wipe everything & start fresh'
+  ```
+
+Your real undo is git. Commit before a `--force` run and the diff tells you
+exactly what the generator changed.
 
 ---
 
