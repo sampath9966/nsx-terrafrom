@@ -34,6 +34,9 @@ CONFIRM_PHRASE="wipe everything & start fresh"
 CONFIRM_ARG="${BOOTSTRAP_CONFIRM:-}"
 CONFIRMED=0
 
+INTERACTIVE=0
+NO_INTERACTIVE=0
+
 created=0
 updated=0
 unchanged=0
@@ -45,9 +48,19 @@ usage() {
 	cat <<'USAGE'
 bootstrap.sh — scaffold the NSX/VCF Terraform repository layout.
 
-Usage: bootstrap.sh [options]
+Usage: bootstrap.sh                 # interactive menu
+       bootstrap.sh [options]       # scripted; any flag suppresses the menu
+
+Run it with no arguments and it asks: basic deployment (best practices assumed,
+three questions), advanced (every option), or update an existing tree. The menu
+prints the equivalent command line before it does anything, so one pass through
+it teaches the flags below. Any flag on the command line means a script is
+driving, so the menu stays out of the way.
 
 Options:
+  -i, --interactive   Force the menu even when other flags are given.
+      --no-interactive
+                      Never show the menu; use defaults and the flags given.
   -d, --dir PATH      Target directory (default: current working directory).
                       Created if it does not exist.
   -f, --force         Overwrite existing REGENERATED files whose content
@@ -120,6 +133,272 @@ die() {
 	exit 1
 }
 
+ARGC=$#
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+#
+# Runs when there are no arguments and there is a terminal, or on --interactive.
+# Any flag on the command line means somebody is scripting this, so the wizard
+# stays out of the way — that is what keeps CI and self-reproduction working.
+#
+# Every question here maps to a flag that already exists. The wizard prints the
+# equivalent command line before it runs, so using it once teaches the flags.
+# ---------------------------------------------------------------------------
+
+can_prompt() { { true </dev/tty; } 2>/dev/null; }
+
+say() { printf '%s\n' "$*" >&2; }
+
+# ask <prompt> <default> — free text, empty input takes the default.
+ask() {
+	local prompt="$1" default="$2" reply=""
+	if [ -n "$default" ]; then
+		printf '%s [%s]: ' "$prompt" "$default" >&2
+	else
+		printf '%s: ' "$prompt" >&2
+	fi
+	IFS= read -r reply </dev/tty || reply=""
+	printf '%s' "${reply:-$default}"
+}
+
+# ask_yes_no <prompt> <default y|n>
+ask_yes_no() {
+	local prompt="$1" default="$2" reply=""
+	while :; do
+		if [ "$default" = y ]; then
+			printf '%s [Y/n]: ' "$prompt" >&2
+		else
+			printf '%s [y/N]: ' "$prompt" >&2
+		fi
+		IFS= read -r reply </dev/tty || reply=""
+		reply="$(printf '%s' "${reply:-$default}" | tr '[:upper:]' '[:lower:]')"
+		case "$reply" in
+		y | yes) return 0 ;;
+		n | no) return 1 ;;
+		*) say "  please answer y or n." ;;
+		esac
+	done
+}
+
+# ask_menu <default-index> <prompt> <label>... — echoes the chosen 1-based index.
+ask_menu() {
+	local default="$1" prompt="$2"
+	shift 2
+	local count=$# i=1 reply=""
+	say ""
+	say "$prompt"
+	say ""
+	for label in "$@"; do
+		printf '  %d) %s\n' "$i" "$label" >&2
+		i=$((i + 1))
+	done
+	say ""
+	while :; do
+		printf 'Select [%s]: ' "$default" >&2
+		IFS= read -r reply </dev/tty || reply=""
+		reply="${reply:-$default}"
+		case "$reply" in
+		'' | *[!0-9]*) ;;
+		*)
+			if [ "$reply" -ge 1 ] && [ "$reply" -le "$count" ]; then
+				printf '%s' "$reply"
+				return 0
+			fi
+			;;
+		esac
+		say "  enter a number from 1 to $count."
+	done
+}
+
+wizard_backend() {
+	local choice
+	choice="$(ask_menu 1 "State backend — where Terraform keeps its state." \
+		"GitLab-managed state  (locking, encryption and history from GitLab)" \
+		"S3 or S3-compatible   (MinIO, Ceph; needs locking configured)" \
+		"Azure blob storage" \
+		"Filesystem on this server   NO LOCKING — lab only" \
+		"Decide later   (placeholder; apply is blocked until you choose)")"
+	case "$choice" in
+	1) BACKEND=http ;;
+	2) BACKEND=s3 ;;
+	3) BACKEND=azurerm ;;
+	4)
+		BACKEND=local
+		say ""
+		say "  Filesystem state has no locking: two runs at once corrupt it."
+		say "  Only defensible with one runner, an encrypted and backed-up"
+		say "  volume, and permissions limited to the pipeline user."
+		;;
+	5) BACKEND=local ;;
+	esac
+}
+
+wizard_summary_and_go() {
+	local mode="create — never overwrites anything that exists"
+	[ "$FORCE" = 1 ] && mode="update — overwrites regenerated files after you type the phrase"
+	[ "$FORCE_DATA" = 1 ] && mode="update — overwrites regenerated files AND estate data after the phrase"
+	[ "$DRY_RUN" = 1 ] && mode="dry run — reports only, writes nothing"
+
+	local backend_label="$BACKEND"
+	[ "$BACKEND" = http ] && backend_label="http (GitLab-managed state)"
+	[ "$BACKEND" = local ] && backend_label="local (placeholder, no locking)"
+
+	local cmd="scripts/bootstrap.sh --dir '$ROOT'"
+	[ "$BACKEND" != local ] && cmd="$cmd --backend $BACKEND"
+	[ "$WITH_EXAMPLES" = 0 ] && cmd="$cmd --no-examples"
+	[ "$WITH_GIT" = 1 ] && cmd="$cmd --git-init"
+	[ "$FORCE_DATA" = 1 ] && cmd="$cmd --force-data"
+	[ "$FORCE" = 1 ] && [ "$FORCE_DATA" = 0 ] && cmd="$cmd --force"
+	[ "$DRY_RUN" = 1 ] && cmd="$cmd --dry-run"
+
+	say ""
+	say "-------------------------------------------------------------------"
+	say "  target directory : $ROOT"
+	say "  state backend    : $backend_label"
+	say "  example data     : $([ "$WITH_EXAMPLES" = 1 ] && echo 'yes' || echo 'no')"
+	say "  git init         : $([ "$WITH_GIT" = 1 ] && echo 'yes' || echo 'no')"
+	say "  mode             : $mode"
+	say "-------------------------------------------------------------------"
+	say ""
+	say "Same thing without the questions, next time:"
+	say "  $cmd"
+	say ""
+
+	ask_yes_no "Proceed?" y || die "cancelled; nothing was written."
+	say ""
+}
+
+wizard_basic() {
+	say ""
+	say "Basic — best practices assumed. Three questions."
+	ROOT="$(ask "Directory to create the repository in" "$ROOT")"
+	wizard_backend
+	if ask_yes_no "Include worked example data? (recommended the first time)" y; then
+		WITH_EXAMPLES=1
+	else
+		WITH_EXAMPLES=0
+	fi
+	# Assumed: git init on a tree that is not already one, and never overwrite.
+	git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || WITH_GIT=1
+	wizard_summary_and_go
+}
+
+wizard_advanced() {
+	say ""
+	say "Advanced — every option."
+	ROOT="$(ask "Directory to create the repository in" "$ROOT")"
+	wizard_backend
+
+	if ask_yes_no "Include worked example data? (4 managers, 10 groups, 4 policy files)" y; then
+		WITH_EXAMPLES=1
+	else
+		WITH_EXAMPLES=0
+	fi
+
+	if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+		say ""
+		say "  Already inside a git working tree; leaving git alone."
+		WITH_GIT=0
+	elif ask_yes_no "Run 'git init' in that directory?" y; then
+		WITH_GIT=1
+	else
+		WITH_GIT=0
+	fi
+
+	local ow
+	ow="$(ask_menu 1 "Existing files — what may this run overwrite?" \
+		"Nothing   (differing files are kept and reported; exit 2)" \
+		"Regenerated files   (modules, stacks, scripts, CI, docs; NOT your data)" \
+		"Regenerated files AND estate data   (data/, inventory/, envs/)")"
+	case "$ow" in
+	1) FORCE=0 FORCE_DATA=0 ;;
+	2) FORCE=1 FORCE_DATA=0 ;;
+	3)
+		FORCE=1 FORCE_DATA=1
+		say ""
+		say "  You will be asked to type the confirmation phrase in full before"
+		say "  anything is overwritten. Imported estate is refused regardless."
+		;;
+	esac
+
+	ask_yes_no "Dry run — report what would be written and change nothing?" n && DRY_RUN=1
+	ask_yes_no "Quiet — print only the summary and warnings?" n && QUIET=1
+
+	wizard_summary_and_go
+}
+
+wizard_update() {
+	say ""
+	say "Update an existing tree — take newer generator output."
+	ROOT="$(ask "Directory of the existing repository" "$ROOT")"
+	[ -d "$ROOT" ] || die "$ROOT does not exist. Use option 1 or 2 to create a new tree."
+
+	local ow
+	ow="$(ask_menu 2 "What may this run overwrite?" \
+		"Nothing   (add missing files only — safest)" \
+		"Regenerated files   (modules, stacks, scripts, CI, docs; NOT your data)" \
+		"Regenerated files AND estate data   (data/, inventory/, envs/)")"
+	case "$ow" in
+	1) FORCE=0 FORCE_DATA=0 ;;
+	2) FORCE=1 FORCE_DATA=0 ;;
+	3) FORCE=1 FORCE_DATA=1 ;;
+	esac
+
+	# Keep whatever backend the tree already uses unless asked to change it.
+	local current=""
+	current="$(sed -n 's/.*backend "\([a-z0-9]*\)".*/\1/p' "$ROOT/stacks/platform/backend.tf" 2>/dev/null | head -1)"
+	if [ -n "$current" ]; then
+		BACKEND="$current"
+		say ""
+		say "  Existing state backend: $current"
+		if ask_yes_no "Change it?" n; then
+			wizard_backend
+		fi
+	else
+		wizard_backend
+	fi
+
+	WITH_EXAMPLES=0 # never re-seed example data into a tree in use
+	ask_yes_no "Dry run first — report what would change and write nothing?" y && DRY_RUN=1
+
+	wizard_summary_and_go
+}
+
+run_wizard() {
+	say ""
+	say "==================================================================="
+	say " NSX / VCF Terraform scaffold                      bootstrap $VERSION"
+	say "==================================================================="
+
+	local choice
+	choice="$(ask_menu 1 "What would you like to do?" \
+		"Basic deployment      — best practices assumed, three questions" \
+		"Advanced deployment   — every option asked" \
+		"Update an existing tree" \
+		"Dry run               — show what a basic run would write" \
+		"Help                  — list every flag" \
+		"Quit")"
+
+	case "$choice" in
+	1) wizard_basic ;;
+	2) wizard_advanced ;;
+	3) wizard_update ;;
+	4)
+		DRY_RUN=1
+		wizard_basic
+		;;
+	5)
+		usage
+		exit 0
+		;;
+	6)
+		say "nothing written."
+		exit 0
+		;;
+	esac
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-d | --dir)
@@ -160,6 +439,15 @@ while [ $# -gt 0 ]; do
 		;;
 	--backend=*)
 		BACKEND="${1#*=}"
+		shift
+		;;
+	-i | --interactive)
+		INTERACTIVE=1
+		shift
+		;;
+	--no-interactive)
+		INTERACTIVE=0
+		NO_INTERACTIVE=1
 		shift
 		;;
 	--git-init)
@@ -206,6 +494,15 @@ while [ $# -gt 0 ]; do
 		die "unknown option: $1 (try --help)" ;;
 	esac
 done
+
+# The menu runs on --interactive, or when invoked bare with a terminal present.
+# A single flag suppresses it: flags mean a script, and a script must not block.
+if [ "$INTERACTIVE" = 1 ]; then
+	can_prompt || die "--interactive needs a terminal. There is none, so nothing was written."
+	run_wizard
+elif [ "$ARGC" -eq 0 ] && [ "$NO_INTERACTIVE" = 0 ] && can_prompt; then
+	run_wizard
+fi
 
 # The Terraform backend type is what goes in backend.tf, but nobody thinks in
 # those terms — GitLab-managed state is the 'http' backend, and MinIO and Ceph
@@ -873,7 +1170,14 @@ By question:
 
 ## Re-running the generator
 
-`scripts/bootstrap.sh` is safe to re-run, and it is how you take updates.
+`scripts/bootstrap.sh` is safe to re-run, and it is how you take updates. Run it
+bare and it offers a menu — pick **Update an existing tree**, which keeps the
+state backend this tree already uses, never re-seeds example data, and offers a
+dry run first:
+
+```bash
+./scripts/bootstrap.sh
+```
 
 **With no flag it never overwrites anything that already exists.** A file whose
 content differs is kept and reported, the run exits `2`, and files that are

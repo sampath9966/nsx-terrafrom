@@ -893,7 +893,9 @@ aspirational.
 ### Scaffolding
 
 ```bash
-scripts/bootstrap.sh                  # scaffold into the current directory
+scripts/bootstrap.sh                  # interactive menu: basic / advanced / update
+scripts/bootstrap.sh --interactive    # force the menu even with other flags
+scripts/bootstrap.sh --no-interactive # never prompt; flags and defaults only
 scripts/bootstrap.sh --dir PATH       # scaffold somewhere else
 scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
@@ -903,6 +905,11 @@ scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
+
+Run bare with a terminal it asks: basic (best practices assumed, three
+questions), advanced (every option), or update an existing tree. Any flag
+suppresses the menu, so scripts and CI are unaffected; without a terminal it
+behaves exactly as it always did.
 
 Self-contained: no network, no dependency on the repository it came from, bash
 and coreutils only. Idempotent — an unchanged file is left alone, an edited one

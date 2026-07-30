@@ -29,14 +29,39 @@ back to this repository.
 
 ```bash
 git clone https://github.com/sampath9966/nsx-terrafrom
-./nsx-terrafrom/scripts/bootstrap.sh --dir ~/work/nsx-estate
-cd ~/work/nsx-estate
+./nsx-terrafrom/scripts/bootstrap.sh
 ```
 
-Look before you leap:
+With no arguments it asks what you want:
+
+```
+ 1) Basic deployment      — best practices assumed, three questions
+ 2) Advanced deployment   — every option asked
+ 3) Update an existing tree
+ 4) Dry run               — show what a basic run would write
+ 5) Help                  — list every flag
+ 6) Quit
+```
+
+- **Basic** asks three things: the directory, the state backend, and whether to
+  include the worked example data. Everything else takes the recommended
+  answer — `git init` on a tree that is not already one, and never overwrite.
+- **Advanced** asks about every flag, including what the run is allowed to
+  overwrite and whether to dry-run first.
+- **Update an existing tree** is the day-two path: it keeps the backend the tree
+  already uses, never re-seeds example data, and offers a dry run first.
+
+Both print the equivalent command line before writing anything, so a single pass
+through the menu gives you the scripted form to put in a runbook.
+
+Everything is also available directly, and **any flag suppresses the menu** —
+which is what keeps CI working:
 
 ```bash
-./scripts/bootstrap.sh --dry-run     # report every file, write nothing
+./nsx-terrafrom/scripts/bootstrap.sh --dir ~/work/nsx-estate --backend gitlab
+./scripts/bootstrap.sh --dry-run          # report every file, write nothing
+./scripts/bootstrap.sh --interactive      # force the menu anyway
+./scripts/bootstrap.sh --no-interactive   # never prompt, even with a terminal
 ```
 
 ### Where it goes — three shapes

@@ -10,9 +10,27 @@ writes the working tree — modules, stacks, schemas, tooling, CI and worked
 example data — into whatever directory you point it at.
 
 ```bash
-./scripts/bootstrap.sh --dir ~/work/nsx     # scaffold a working tree
+./scripts/bootstrap.sh          # interactive: pick basic or advanced, answer, done
+```
+
+```
+ 1) Basic deployment      — best practices assumed, three questions
+ 2) Advanced deployment   — every option asked
+ 3) Update an existing tree
+ 4) Dry run               — show what a basic run would write
+```
+
+**Basic** asks where to put it, which state backend, and whether to include the
+worked example — everything else takes the recommended answer. **Advanced** asks
+about every flag. Either way it prints the equivalent command line before it
+writes anything, so one pass teaches you the scripted form:
+
+```bash
+./scripts/bootstrap.sh --dir ~/work/nsx --backend gitlab --git-init
 cd ~/work/nsx && make validate              # offline checks, no credentials
 ```
+
+Any flag on the command line suppresses the menu, so CI is unaffected.
 
 `docs/SETUP.md` walks the whole thing, including the choices you have to make.
 
@@ -69,9 +87,7 @@ It is self-contained: no network, no package install, and no dependency on this
 repository once generated. It copies itself and `docs/ARCHITECTURE.md` into the
 tree it creates, so that tree can regenerate and update itself.
 
-It is also idempotent and non-destructive. `--force` refreshes only the
-generator's own output; estate data needs `--force-data`, and anything recorded
-as imported from a live manager is never overwritten by any flag.
+It is also idempotent and non-destructive — see below.
 
 ## Why the state is split five ways
 
