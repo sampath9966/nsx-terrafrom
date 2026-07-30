@@ -480,6 +480,41 @@ overwritten by the generator, by any flag. Re-running the importer writes a
 
 ---
 
+## 4b. Are you ready?
+
+Generating the files is not the same as being ready to apply them.
+
+```bash
+make ready
+```
+
+It exits non-zero while anything blocks, so it works as a gate in a pipeline or
+a runbook. On a freshly generated tree it reports four blocking items, which is
+correct — that tree is not production ready:
+
+```
+BLOCK   state is still the placeholder local backend, which has NO LOCKING.
+BLOCK   no .terraform.lock.hcl committed.
+BLOCK   inventory/ and data/ are still the shipped EXAMPLE content.
+BLOCK   no git remote. Nothing is pushed, so nothing can be reviewed.
+```
+
+It also prints what it **cannot** see, because those live on your git host and
+in Vault rather than in this repository:
+
+- branch protection on the default branch;
+- an approval requirement on merge/pull requests;
+- `VAULT_ADDR` and a read-only `VAULT_PLAN_TOKEN`;
+- `VAULT_APPLY_TOKEN`, marked protected;
+- a protected environment (GitLab) or required reviewers (GitHub) on apply;
+- whether a `terraform plan` has ever run against a real manager.
+
+Delete `data/.example-content` once the estate data is yours — that is how you
+tell the check the data is real, and re-running the generator will not put it
+back.
+
+---
+
 ## 5. First contact with a manager
 
 Everything above is offline. From here a mistake reaches a live firewall.

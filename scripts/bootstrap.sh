@@ -742,6 +742,11 @@ if [ -f "$CONF" ]; then
 	[ "$BACKEND" = local ] && [ -n "${SAVED_BACKEND:-}" ] && BACKEND="$SAVED_BACKEND"
 fi
 
+# Nobody chose, and nobody was asked (a flag suppressed the menu, or there is no
+# terminal). Take the documented default rather than a half-configured tree that
+# has a GitLab pipeline in it but is not a git repository.
+[ "$VCS" = ask ] && VCS=gitlab
+
 # The pipeline follows the host, unless --ci said otherwise.
 if [ "$CI_EXPLICIT" = 0 ]; then
 	case "$VCS" in
@@ -821,6 +826,12 @@ cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
 MANIFEST="$ROOT/data/.import-manifest.json"
+
+# Was the example data already seeded before this run? Used for the
+# data/.example-content marker, which must be written once and then stay
+# deleted: removing it is how somebody says "this estate is real now", and a
+# re-run must not undo that.
+if [ -f "$ROOT/inventory/managers.yaml" ]; then SEEDED_ALREADY=1; else SEEDED_ALREADY=0; fi
 
 # is_estate_data <relative-path>
 #
@@ -1104,6 +1115,10 @@ help: ## Show this help
 .PHONY: preflight
 preflight: ## Check that the tools this repository needs are present
 	@scripts/preflight.sh
+
+.PHONY: ready
+ready: ## Is this repository ready to apply to a production estate? Exits 1 if not.
+	@scripts/readiness.sh
 
 .PHONY: validate
 validate: schema-validate fmt-check ## Run every offline check (no credentials, no network)
@@ -1405,8 +1420,15 @@ refreshes a transport zone:
 ```bash
 make preflight     # are the tools here
 make validate      # schema + convention checks. Offline, no credentials.
+make ready         # what still stands between this and production
 make matrix        # what CI would run, derived from the inventory
 ```
+
+`make ready` is the honest one. A freshly generated tree is **not** production
+ready and it will tell you exactly why — placeholder backend, example data, no
+lock files, no remote — and exit non-zero until those are dealt with. It also
+lists what it cannot see: branch protection, CI variables, and whether a plan
+has ever run against a real manager.
 
 Then, in order:
 
@@ -7278,6 +7300,203 @@ main "$@"
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-up.sh
 
+write_file scripts/readiness.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Is this repository ready to run against a production estate?
+#
+#   scripts/readiness.sh            report; exit 1 if anything blocking remains
+#   scripts/readiness.sh --quiet    summary only
+#
+# Everything here is offline. It answers the question bootstrap.sh cannot:
+# generating the files is not the same as being ready to apply them, and the
+# difference is a list of decisions and credentials that belong to you.
+#
+# BLOCK  must be fixed before applying to production
+# WARN   should be fixed; not fatal
+# MANUAL cannot be checked from here — it lives on the git host or in Vault
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+QUIET=0
+[ "${1:-}" = "--quiet" ] && QUIET=1
+
+blocking=0
+warnings=0
+
+block() {
+	blocking=$((blocking + 1))
+	[ "$QUIET" = 1 ] || printf 'BLOCK   %s\n' "$*"
+}
+warn() {
+	warnings=$((warnings + 1))
+	[ "$QUIET" = 1 ] || printf 'WARN    %s\n' "$*"
+}
+ok() { [ "$QUIET" = 1 ] || printf 'ok      %s\n' "$*"; }
+manual() { [ "$QUIET" = 1 ] || printf 'MANUAL  %s\n' "$*"; }
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+
+say ""
+say "=== state ==================================================="
+
+# The most common way to reach production with something unsafe.
+if grep -rqs 'backend "local"' stacks/*/backend.tf; then
+	block "state is still the placeholder local backend, which has NO LOCKING.
+        scripts/bootstrap.sh --force --backend gitlab|s3|azure"
+else
+	backend="$(sed -n 's/.*backend "\([a-z0-9]*\)".*/\1/p' stacks/platform/backend.tf 2>/dev/null | head -1)"
+	ok "state backend is '${backend:-unknown}', not the placeholder"
+	if [ "$backend" = http ]; then
+		if ls envs/*.backend.hcl >/dev/null 2>&1 && ! grep -lqs 'lock_address' envs/*.backend.hcl; then
+			block "http backend with no lock_address in envs/*.backend.hcl — no locking"
+		else
+			ok "http backend declares lock_address"
+		fi
+	fi
+fi
+
+if [ -z "$(ls envs/*.backend.hcl 2>/dev/null)" ]; then
+	block "no envs/<site>.backend.hcl — nothing can initialise"
+else
+	empty=0
+	total=0
+	for f in envs/*.backend.hcl; do
+		total=$((total + 1))
+		grep -qv '^[[:space:]]*\(#.*\)\?$' "$f" 2>/dev/null || empty=$((empty + 1))
+	done
+	if [ "$empty" -gt 0 ]; then
+		warn "$empty of $total backend config file(s) contain only comments"
+	else
+		ok "every envs/*.backend.hcl has content"
+	fi
+fi
+
+locks="$(find stacks -name .terraform.lock.hcl 2>/dev/null | wc -l | tr -d ' ')"
+stacks="$(find stacks -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$locks" -eq 0 ]; then
+	block "no .terraform.lock.hcl committed. Run terraform init in each stack and
+        commit the lock files, or sites will realize different provider behaviour."
+elif [ "$locks" -lt "$stacks" ]; then
+	warn "$locks of $stacks stacks have a committed .terraform.lock.hcl"
+else
+	ok "every stack has a committed .terraform.lock.hcl"
+fi
+
+say ""
+say "=== the estate ============================================="
+
+if [ -f data/.example-content ]; then
+	block "inventory/ and data/ are still the shipped EXAMPLE content, which
+        describes no real site. Replace them, then delete data/.example-content."
+else
+	ok "example content marker is gone"
+fi
+
+if [ ! -f inventory/managers.yaml ]; then
+	block "inventory/managers.yaml is missing — every run resolves its manager here"
+else
+	if grep -qs 'example\.internal\|example\.com' inventory/managers.yaml; then
+		warn "inventory/managers.yaml still contains example hostnames"
+	else
+		ok "inventory hostnames look real"
+	fi
+	if ! grep -qs 'vault_path' inventory/managers.yaml; then
+		block "no vault_path in the inventory — credentials cannot be resolved"
+	else
+		ok "every manager records a vault_path"
+	fi
+fi
+
+say ""
+say "=== validation ============================================="
+
+if command -v python3 >/dev/null 2>&1; then
+	if python3 scripts/validate-data.py >/dev/null 2>&1; then
+		ok "scripts/validate-data.py passes"
+	else
+		block "scripts/validate-data.py fails. Run it for the detail."
+	fi
+else
+	warn "python3 not found; data validation was not run"
+fi
+
+if command -v terraform >/dev/null 2>&1; then
+	if terraform fmt -recursive -check . >/dev/null 2>&1; then
+		ok "terraform fmt is clean"
+	else
+		warn "terraform fmt -recursive -check reports changes"
+	fi
+else
+	warn "terraform not found; fmt was not run"
+fi
+
+say ""
+say "=== review pipeline ========================================"
+
+has_ci=0
+[ -f .gitlab-ci.yml ] && {
+	ok "GitLab pipeline present (.gitlab-ci.yml)"
+	has_ci=1
+}
+[ -n "$(ls .github/workflows/*.yml 2>/dev/null)" ] && {
+	ok "GitHub workflows present ($(ls .github/workflows/*.yml | wc -l | tr -d ' ') files)"
+	has_ci=1
+}
+if [ "$has_ci" = 0 ]; then
+	block "no pipeline. Every change would be applied by hand with no record of
+        who approved it.  scripts/enable-gitops.sh"
+fi
+
+if git rev-parse --git-dir >/dev/null 2>&1; then
+	ok "this is a git working tree"
+	if git remote get-url origin >/dev/null 2>&1; then
+		ok "remote 'origin' is $(git remote get-url origin)"
+	else
+		block "no git remote. Nothing is pushed, so nothing can be reviewed."
+	fi
+	if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
+		warn "working tree has uncommitted changes"
+	else
+		ok "working tree is clean"
+	fi
+	tracked_state="$(git ls-files 2>/dev/null | grep -E '\.tfstate|/tfplan$|\.tfplan$' || true)"
+	if [ -n "$tracked_state" ]; then
+		block "state or plan files are tracked in git: $tracked_state"
+	else
+		ok "no state or plan files tracked in git"
+	fi
+else
+	block "not a git repository. There is no history of who changed a rule.
+        scripts/enable-gitops.sh"
+fi
+
+say ""
+say "=== cannot be checked from here ============================"
+manual "branch protection on the default branch, so nobody can push to it"
+manual "an approval requirement on merge/pull requests"
+manual "VAULT_ADDR and a READ-ONLY VAULT_PLAN_TOKEN in the CI settings"
+manual "VAULT_APPLY_TOKEN, marked PROTECTED so only protected branches can apply"
+manual "a protected environment (GitLab) or required reviewers (GitHub) on apply"
+manual "a terraform plan actually run against a manager — schema validity is not API validity"
+
+say ""
+say "==========================================================="
+printf 'readiness: %s blocking, %s warning(s)\n' "$blocking" "$warnings"
+if [ "$blocking" -gt 0 ]; then
+	say ""
+	say "NOT ready for production. The BLOCK items above are the reason."
+	exit 1
+fi
+say ""
+say "No blocking items. The MANUAL list is still yours to confirm — this script"
+say "cannot see your git host or your Vault."
+exit 0
+SCAFFOLD_EOF
+mark_executable scripts/readiness.sh
+
 write_file scripts/enable-gitops.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -8663,6 +8882,18 @@ tier0s:
       - scope: env
         tag: prod
 SCAFFOLD_EOF
+
+	if [ "$SEEDED_ALREADY" = 0 ]; then
+		write_file data/.example-content <<'SCAFFOLD_EOF'
+This file marks inventory/ and data/ as the shipped EXAMPLE content: four
+managers and one site that exist nowhere, written so the validators and
+terraform have something to chew on.
+
+scripts/readiness.sh treats its presence as "this estate is not real yet".
+DELETE IT once you have replaced the example data with your own; re-running the
+generator will not bring it back.
+SCAFFOLD_EOF
+	fi
 
 	write_file data/vm-tags/lon1.yaml <<'SCAFFOLD_EOF'
 # VM tag assignments at lon1 — variant B in docs/TAGGING.md.
