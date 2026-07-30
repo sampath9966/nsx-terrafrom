@@ -1455,9 +1455,17 @@ rather than a trap.
 | `VAULT_PLAN_TOKEN` | **read-only** token | masked |
 | `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
 | `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
+| `NSX_APPLY_MODE` | `manual` (default) or `auto` | optional |
 
 If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
 and the approver reads the plan in the job log instead.
+
+On GitHub the equivalents are repository secrets `VAULT_ADDR`,
+`VAULT_PLAN_TOKEN` and `VAULT_APPLY_TOKEN`; the plan comment uses the built-in
+`GITHUB_TOKEN` and needs nothing extra. The apply gate is
+**Settings → Environments → `nsx-<site>-<stack>` → Required reviewers**, and
+`VAULT_APPLY_TOKEN` should be scoped to those environments so a plan job can
+never reach it.
 
 ## How the per-manager jobs appear
 
@@ -1484,6 +1492,43 @@ says what Terraform will do.
 - **The default rule and the Emergency category are untouched**, unless that is
   explicitly what the change is for, in which case it is a restricted change and
   needs the change advisory (`docs/ARCHITECTURE.md` §11).
+
+## Where this matches the standard flow, and where it does not
+
+The shape is the usual one: feature branch, pull/merge request, CI runs fmt,
+validate, data checks and plan, the plan is commented on the request, a reviewer
+approves, it merges, and a CD pipeline applies on the default branch. Both
+`.gitlab-ci.yml` and `.github/workflows/` implement all of that.
+
+Two deliberate differences, both because this applies firewall rules across a
+federated estate rather than creating a bucket:
+
+**1. The apply is gated a second time, and defaults to waiting for a human.**
+
+An approved merge request says *the change is wanted*. It does not say *this
+plan, computed against the estate as it is right now, is what should be applied*.
+Between approval and merge the estate can move. So merging queues the apply and
+a person starts it, with the plan in front of them.
+
+| | GitLab | GitHub |
+|---|---|---|
+| Gate | `when: manual` job | Environment required reviewers |
+| Turn it off | `NSX_APPLY_MODE=auto` in CI/CD variables | leave the environment unprotected |
+
+Setting it to apply on merge makes this exactly the standard diagram. That is
+reasonable for a lab. On a production firewall it means a merge is the last
+moment anybody sees what is about to happen.
+
+**2. The apply does not re-plan.**
+
+The common pattern re-runs `terraform plan` in the CD job and applies the result.
+This applies the **saved plan artifact** the approver looked at. If the estate
+drifted in between, the apply fails on a stale plan instead of quietly applying
+something nobody reviewed. `scripts/tf.sh apply` enforces it: no saved plan, no
+apply.
+
+Everything else — fmt, validate, data schema checks, plan on every request, the
+comment, the merge — is the diagram.
 
 ## When there is no pipeline yet
 
@@ -7317,6 +7362,17 @@ from ci_matrix_lib import entries  # noqa: E402
 DEFAULT_BRANCH = os.environ.get("CI_DEFAULT_BRANCH", "main")
 IS_DEFAULT_BRANCH = os.environ.get("CI_COMMIT_BRANCH") == DEFAULT_BRANCH
 
+# manual (default): merging queues the apply, and a human starts it with the
+# plan in front of them. auto: apply runs on merge, no second pause.
+#
+# Set NSX_APPLY_MODE=auto in the project's CI/CD variables if the estate is a
+# lab, or if the merge request approval is the only gate you want. On a
+# production firewall across 10+ managers, keep it manual: an approved merge
+# request says the change is wanted, not that this plan is what to apply now.
+APPLY_MODE = os.environ.get("NSX_APPLY_MODE", "manual").strip().lower()
+if APPLY_MODE not in ("manual", "auto"):
+    sys.exit(f"error: NSX_APPLY_MODE must be 'manual' or 'auto', got {APPLY_MODE!r}")
+
 
 def job_name(prefix: str, row: dict) -> str:
     return f"{prefix} {row['stack']} @ {row['site']}"
@@ -7374,9 +7430,12 @@ def main() -> int:
         out.append("  needs:")
         out.append(f'    - job: "{plan}"')
         out.append("      artifacts: true")
-        # The gate. GitLab will not start this without a human, and a protected
-        # environment restricts who that human can be.
-        out.append("  when: manual")
+        # The gate. A manual job will not start without a human, and a
+        # protected environment restricts who that human can be.
+        if APPLY_MODE == "manual":
+            out.append("  when: manual")
+        else:
+            out.append("  when: on_success")
         out.append("  allow_failure: false")
         out.append("  environment:")
         out.append(f'    name: nsx/{row["site"]}/{row["stack"]}')
@@ -7403,16 +7462,19 @@ mark_executable scripts/gitlab-child-pipeline.py
 write_file scripts/post-plan-comment.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
-# Post a rendered plan summary to the merge request, so the approver reads the
-# plan in the review rather than digging through job logs.
+# Post a rendered plan onto the merge request or pull request, so the approver
+# reads the plan in the review rather than digging through job logs.
 #
 #   scripts/post-plan-comment.sh <stack> <site> <rendered-plan-file>
 #
-# Never posts the plan FILE — that is a sensitive artifact. It posts the
-# rendered text, truncated, which is what a human needs to make the decision.
+# Works on GitLab and on GitHub Actions, detected from the environment, so the
+# two platforms cannot drift apart in what a reviewer sees.
 #
-# Silently does nothing outside a merge request pipeline, or when
-# CI_API_TOKEN is not set, so it is safe to call unconditionally.
+# Never posts the plan FILE — that is a sensitive artifact. It posts the
+# rendered text, truncated, which is what a human needs to decide.
+#
+# A no-op outside a merge/pull request, or without a token. Safe to call
+# unconditionally: a missing token must not fail the plan.
 
 set -euo pipefail
 
@@ -7420,19 +7482,13 @@ stack="${1:?stack}"
 site="${2:?site}"
 plan_file="${3:?rendered plan file}"
 
-[ -n "${CI_MERGE_REQUEST_IID:-}" ] || {
-	echo "not a merge request pipeline; skipping the plan comment."
+[ -f "$plan_file" ] || {
+	echo "no rendered plan at $plan_file; nothing to post."
 	exit 0
 }
-[ -n "${CI_API_TOKEN:-}" ] || {
-	echo "CI_API_TOKEN is not set; skipping the plan comment. Set it to post plans to the MR."
-	exit 0
-}
-
-api="${CI_API_V4_URL:?}/projects/${CI_PROJECT_ID:?}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
 
 # GitLab rejects very large notes, and nobody reads 4000 lines of plan anyway.
-max_lines=300
+max_lines="${PLAN_COMMENT_MAX_LINES:-300}"
 total="$(wc -l <"$plan_file" | tr -d ' ')"
 body_file="$(mktemp)"
 trap 'rm -f "$body_file"' EXIT
@@ -7440,27 +7496,77 @@ trap 'rm -f "$body_file"' EXIT
 {
 	printf '### Terraform plan — `%s` @ `%s`\n\n' "$stack" "$site"
 	if grep -qE '^(Plan:|No changes)' "$plan_file"; then
-		printf '%s\n\n' "$(grep -E '^(Plan:|No changes)' "$plan_file" | head -1)"
+		printf '**%s**\n\n' "$(grep -E '^(Plan:|No changes)' "$plan_file" | head -1)"
 	fi
 	printf '<details><summary>plan output (%s lines)</summary>\n\n```\n' "$total"
 	head -n "$max_lines" "$plan_file"
 	if [ "$total" -gt "$max_lines" ]; then
-		printf '\n... truncated at %s lines. Full output in job %s.\n' "$max_lines" "${CI_JOB_URL:-}"
+		printf '\n... truncated at %s lines. Full output in the job log.\n' "$max_lines"
 	fi
 	printf '```\n\n</details>\n\n'
+	printf 'Reviewer checklist:\n\n'
 	printf -- '- [ ] resource count delta matches the intent\n'
 	printf -- '- [ ] no unexpected destroys\n'
 	printf -- '- [ ] no change to the default rule or the Emergency category\n'
 	printf -- '- [ ] every new or changed rule has a non-empty scope\n'
 } >"$body_file"
 
-curl --silent --show-error --fail-with-body \
-	--header "PRIVATE-TOKEN: ${CI_API_TOKEN}" \
-	--header "Content-Type: application/x-www-form-urlencoded" \
-	--data-urlencode "body@$body_file" \
-	--request POST "$api" >/dev/null
+post_gitlab() {
+	[ -n "${CI_API_TOKEN:-}" ] || {
+		echo "CI_API_TOKEN is not set; skipping the plan comment. Set it to post plans to the MR."
+		return 0
+	}
+	curl --silent --show-error --fail-with-body --max-time 60 \
+		--header "PRIVATE-TOKEN: ${CI_API_TOKEN}" \
+		--data-urlencode "body@$body_file" \
+		--request POST \
+		"${CI_API_V4_URL:?}/projects/${CI_PROJECT_ID:?}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" >/dev/null &&
+		echo "posted the plan for $stack @ $site to merge request !${CI_MERGE_REQUEST_IID}"
+}
 
-echo "posted the plan for $stack @ $site to merge request !${CI_MERGE_REQUEST_IID}"
+post_github() {
+	local token="${GITHUB_TOKEN:-}"
+	[ -n "$token" ] || {
+		echo "GITHUB_TOKEN is not set; skipping the plan comment."
+		return 0
+	}
+	local pr
+	pr="$(python3 -c "
+import json, os, sys
+p = os.environ.get('GITHUB_EVENT_PATH')
+if not p or not os.path.exists(p):
+    sys.exit(0)
+with open(p) as f:
+    ev = json.load(f)
+n = (ev.get('pull_request') or {}).get('number') or (ev.get('issue') or {}).get('number')
+print(n or '')
+" 2>/dev/null || true)"
+	[ -n "$pr" ] || {
+		echo "not a pull request event; skipping the plan comment."
+		return 0
+	}
+	# jq is not guaranteed on a runner; python is.
+	python3 -c "
+import json, sys
+print(json.dumps({'body': open(sys.argv[1]).read()}))
+" "$body_file" >"$body_file.json"
+	curl --silent --show-error --fail-with-body --max-time 60 \
+		--header "Authorization: Bearer ${token}" \
+		--header "Accept: application/vnd.github+json" \
+		--data "@$body_file.json" \
+		--request POST \
+		"${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY:?}/issues/${pr}/comments" >/dev/null &&
+		echo "posted the plan for $stack @ $site to pull request #${pr}"
+	rm -f "$body_file.json"
+}
+
+if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+	post_gitlab
+elif [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+	post_github
+else
+	echo "not a merge or pull request pipeline; skipping the plan comment."
+fi
 SCAFFOLD_EOF
 mark_executable scripts/post-plan-comment.sh
 
@@ -7569,10 +7675,137 @@ jobs:
 
       - name: Render plan summary
         run: |
-          # The saved plan is a sensitive artifact. Post the rendered summary,
-          # never the plan file itself.
+          # The saved plan is a sensitive artifact. Render the summary, post
+          # that, never the plan file itself.
           scripts/tf.sh show "${{ matrix.stack }}" "${{ matrix.site }}" \
-            | tee "$GITHUB_STEP_SUMMARY" >/dev/null
+            | tee "plan-${{ matrix.stack }}-${{ matrix.site }}.txt" \
+            | tee -a "$GITHUB_STEP_SUMMARY" >/dev/null
+
+      - name: Comment the plan on the pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          scripts/post-plan-comment.sh "${{ matrix.stack }}" "${{ matrix.site }}" \
+            "plan-${{ matrix.stack }}-${{ matrix.site }}.txt"
+
+      - name: Keep the saved plan for the apply workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.stack }}-${{ matrix.site }}
+          path: stacks/${{ matrix.stack }}/tfplan
+          retention-days: 7
+          if-no-files-found: error
+SCAFFOLD_EOF
+
+write_file .github/workflows/apply.yml <<'SCAFFOLD_EOF'
+# CD. Runs on a push to the default branch — that is, on a merged pull request.
+#
+#   plan    re-plan on the merged tree, render it, keep it as an artifact
+#   GATE    the apply job targets a GitHub Environment. Configure required
+#           reviewers on that environment and the run pauses here until a human
+#           approves, with the plan from the previous job in front of them.
+#   apply   applies the SAVED plan from the plan job. Never a fresh one.
+#
+# The gate is a repository setting rather than something hard-coded here:
+#   Settings -> Environments -> nsx-<site>-<stack> -> Required reviewers
+# With no reviewers configured this applies automatically on merge, which is the
+# right behaviour for a lab and the wrong one for a production firewall.
+#
+# See docs/GITOPS.md.
+name: apply
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One apply at a time. Terraform state locking is the backstop, not the plan.
+  group: nsx-apply-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: build
+        run: echo "matrix=$(python3 scripts/ci-matrix.py --format github)" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: plan ${{ matrix.stack }} @ ${{ matrix.site }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Plan
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_PLAN_TOKEN }}
+        run: |
+          scripts/with-credentials.sh "${{ matrix.site }}" -- \
+            scripts/tf.sh plan "${{ matrix.stack }}" "${{ matrix.site }}"
+
+      - name: Render it for the approver
+        run: |
+          scripts/tf.sh show "${{ matrix.stack }}" "${{ matrix.site }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY" >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.stack }}-${{ matrix.site }}
+          path: stacks/${{ matrix.stack }}/tfplan
+          retention-days: 7
+          if-no-files-found: error
+
+  apply:
+    name: apply ${{ matrix.stack }} @ ${{ matrix.site }}
+    needs: [matrix, plan]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    # The approval gate. Protect this environment to require a reviewer.
+    environment: nsx-${{ matrix.site }}-${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.stack }}-${{ matrix.site }}
+          path: stacks/${{ matrix.stack }}/
+
+      - name: Apply the plan that was approved
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_APPLY_TOKEN }}
+          APPROVE: "yes"
+        run: |
+          test -f "stacks/${{ matrix.stack }}/tfplan" || {
+            echo "no saved plan artifact; re-run the plan job" >&2; exit 1; }
+          scripts/with-credentials.sh "${{ matrix.site }}" -- \
+            scripts/tf.sh apply "${{ matrix.stack }}" "${{ matrix.site }}"
 SCAFFOLD_EOF
 
 write_file .github/pull_request_template.md <<'SCAFFOLD_EOF'
