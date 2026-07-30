@@ -903,7 +903,9 @@ scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --confirm TEXT   # the overwrite phrase, for a pipeline
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
-scripts/bootstrap.sh --vcs KIND       # git | gitlab-docker | none
+scripts/bootstrap.sh --vcs KIND       # gitlab (default) | gitlab-docker |
+                                     #   github | git | none
+scripts/bootstrap.sh --ci PLATFORM   # gitlab | github | both | none
 scripts/bootstrap.sh --git-remote URL # attach 'origin'; implies --vcs git
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
@@ -979,6 +981,15 @@ PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
 subset when it is not.
 
 ### Review pipeline
+
+The pipeline that gets written follows the host, and **GitLab is the default**:
+it is the only one this script can set up end to end — server, project, runner,
+variables and approval gate. GitHub gets complete workflows but the secrets and
+environment protection are the owner's to configure. `--vcs none` writes no
+pipeline at all and leaves the manual `make plan` / `make apply` path, which
+`scripts/tf.sh` still guards. The answer is recorded in `.nsx-bootstrap.conf` so
+a re-run does not change the shape of the tree.
+
 
 ```bash
 scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git

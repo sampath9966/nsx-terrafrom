@@ -40,9 +40,15 @@ NO_INTERACTIVE=0
 # Where the files live and how changes get reviewed. Chosen at first run, and
 # changeable later with scripts/enable-gitops.sh — the pipeline files are always
 # generated, so this only drives what happens after generation.
-VCS=ask          # ask | none | git | gitlab-docker
+VCS=ask          # ask | none | git | github | gitlab | gitlab-docker
 GIT_REMOTE=""
 GIT_BRANCH=main
+
+# Which pipeline definitions get written. GitLab is the default because it is
+# the only one this script can set up end to end — repository, runner, variables
+# and gate — rather than leaving files for somebody to wire up.
+CI_PLATFORM=gitlab   # gitlab | github | both | none
+CI_EXPLICIT=0        # set when --ci was given, so a VCS choice does not override it
 
 created=0
 updated=0
@@ -65,22 +71,30 @@ it teaches the flags below. Any flag on the command line means a script is
 driving, so the menu stays out of the way.
 
 Options:
-      --vcs KIND      Where these files live and how changes are reviewed:
+      --vcs KIND      Where these files live and how changes are reviewed.
+                      GitLab is the default: it is the only host this script can
+                      set up end to end rather than leaving files to wire up.
 
-                        git             an existing repository; pass
-                                        --git-remote URL
+                        gitlab          an existing GitLab. Full pipeline.
+                                        Pass --git-remote URL.       [default]
                         gitlab-docker   stand up GitLab CE and a runner in
-                                        Docker after generating, create the
-                                        repository, push, and print the initial
-                                        root password
-                        none            local files only; no versioning and no
-                                        review pipeline
+                                        Docker, create the repository, push,
+                                        register the runner, and print the
+                                        initial root password.
+                        github          GitHub. Workflows are written; you set
+                                        the secrets and protect the apply
+                                        environments.
+                        git             another git host. Both sets of CI files
+                                        are written and their location printed.
+                        none            local files only. No versioning, no
+                                        pipeline — plan and apply by hand.
 
-                      Changeable later with scripts/enable-gitops.sh: the
-                      pipeline files are generated either way, so this only
-                      decides what happens after generation.
+                      Changeable later with scripts/enable-gitops.sh, which
+                      writes whatever pipeline is missing.
+      --ci PLATFORM   Which pipeline definitions to write: gitlab, github, both
+                      or none. Follows --vcs unless given explicitly.
       --git-remote URL
-                      Remote to attach as 'origin'. Implies --vcs git.
+                      Remote to attach as 'origin'.
       --git-branch NAME
                       Default branch name (default: main).
   -i, --interactive   Force the menu even when other flags are given.
@@ -243,33 +257,78 @@ ask_menu() {
 wizard_vcs() {
 	local choice
 	choice="$(ask_menu 1 "Where do these files live, and how do changes get reviewed?" \
-		"An existing git repository   — I have the URL" \
-		"Stand up GitLab locally in Docker and create the repository" \
-		"Local files only   — no versioning, no review pipeline")"
+		"GitLab   — full CI/CD pipeline, set up for you      (recommended)" \
+		"GitHub   — workflows written; you wire them up" \
+		"Another git host — CI files written; you wire them up" \
+		"Local files only — no versioning, no pipeline, manual apply")"
+
 	case "$choice" in
 	1)
-		VCS=git
-		GIT_REMOTE="$(ask "  Remote URL (git@host:group/repo.git, or https://...)" "")"
-		[ -n "$GIT_REMOTE" ] || {
-			say "  no URL given; leaving version control for later."
+		CI_PLATFORM=gitlab
+		CI_EXPLICIT=1
+		local how
+		how="$(ask_menu 1 "  GitLab — which one?" \
+			"I have a GitLab and the repository URL" \
+			"Stand one up locally in Docker and create the repository" \
+			"Not yet — just write the pipeline, I will connect it later")"
+		case "$how" in
+		1)
+			VCS=gitlab
+			GIT_REMOTE="$(ask "  Repository URL (git@gitlab.example.com:group/repo.git)" "")"
+			[ -n "$GIT_REMOTE" ] || {
+				say "  no URL given; writing the pipeline and leaving the remote for later."
+				VCS=none
+			}
+			[ "$VCS" = gitlab ] && GIT_BRANCH="$(ask "  Default branch" "$GIT_BRANCH")"
+			;;
+		2)
+			VCS=gitlab-docker
+			say ""
+			say "  GitLab CE and a runner will be started in Docker after the files"
+			say "  are written, the repository created and pushed, the runner"
+			say "  registered, and the initial root password printed."
+			say "  Needs docker and roughly 4 GB of RAM; first boot takes minutes."
+			;;
+		3)
 			VCS=none
-		}
-		[ "$VCS" = git ] && GIT_BRANCH="$(ask "  Default branch" "$GIT_BRANCH")"
+			say ""
+			say "  Pipeline written, nothing connected."
+			say "  When ready:  scripts/enable-gitops.sh"
+			;;
+		esac
 		;;
 	2)
-		VCS=gitlab-docker
+		VCS=github
+		CI_PLATFORM=github
+		CI_EXPLICIT=1
+		GIT_REMOTE="$(ask "  Repository URL (git@github.com:org/repo.git), or blank for later" "")"
+		[ -n "$GIT_REMOTE" ] || VCS=none
 		say ""
-		say "  GitLab CE and a runner will be started in Docker after the files"
-		say "  are written, the repository created and pushed, and the initial"
-		say "  root password printed. First boot takes several minutes."
-		say "  Needs docker and roughly 4 GB of RAM."
+		say "  Workflows go in .github/workflows/ — validate, plan and apply."
+		say "  You will need to set the repository secrets and protect the apply"
+		say "  environments yourself; docs/GITOPS.md lists exactly which."
 		;;
 	3)
-		VCS=none
+		VCS=git
+		CI_PLATFORM=both
+		CI_EXPLICIT=1
+		GIT_REMOTE="$(ask "  Repository URL, or blank for later" "")"
+		[ -n "$GIT_REMOTE" ] || VCS=none
 		say ""
-		say "  No versioning, so no review pipeline and no record of who changed"
-		say "  a firewall rule or why. The pipeline files are still written, so"
-		say "  scripts/enable-gitops.sh can turn this on whenever you want."
+		say "  Both .gitlab-ci.yml and .github/workflows/ are written; point your"
+		say "  host at whichever it understands and delete the other."
+		;;
+	4)
+		VCS=none
+		CI_PLATFORM=none
+		CI_EXPLICIT=1
+		say ""
+		say "  No versioning and no pipeline. Changes are applied by hand with"
+		say "  make plan / make show / make apply, which still refuse to apply"
+		say "  without a saved plan and an explicit APPROVE=yes."
+		say ""
+		say "  Nothing will record who changed a firewall rule, when, or why."
+		say "  scripts/enable-gitops.sh adds all of it later."
 		;;
 	esac
 }
@@ -309,9 +368,12 @@ wizard_summary_and_go() {
 
 	local cmd="scripts/bootstrap.sh --dir '$ROOT'"
 	[ "$BACKEND" != local ] && cmd="$cmd --backend $BACKEND"
-	[ "$VCS" = git ] && cmd="$cmd --git-remote '$GIT_REMOTE'"
-	[ "$VCS" = gitlab-docker ] && cmd="$cmd --vcs gitlab-docker"
-	[ "$VCS" = none ] && cmd="$cmd --vcs none"
+	case "$VCS" in
+	gitlab | github | git) cmd="$cmd --vcs $VCS --git-remote '$GIT_REMOTE'" ;;
+	gitlab-docker) cmd="$cmd --vcs gitlab-docker" ;;
+	none) cmd="$cmd --vcs none" ;;
+	esac
+	cmd="$cmd --ci $CI_PLATFORM"
 	[ "$WITH_EXAMPLES" = 0 ] && cmd="$cmd --no-examples"
 	[ "$WITH_GIT" = 1 ] && cmd="$cmd --git-init"
 	[ "$FORCE_DATA" = 1 ] && cmd="$cmd --force-data"
@@ -322,14 +384,23 @@ wizard_summary_and_go() {
 	say "-------------------------------------------------------------------"
 	local vcs_label
 	case "$VCS" in
-	git) vcs_label="git — $GIT_REMOTE (branch $GIT_BRANCH)" ;;
+	gitlab | github | git) vcs_label="$VCS — ${GIT_REMOTE:-no remote yet} (branch $GIT_BRANCH)" ;;
 	gitlab-docker) vcs_label="GitLab in Docker, started after generation" ;;
-	none) vcs_label="local files only — no review pipeline (migrate later)" ;;
+	none) vcs_label="local files only — no remote (migrate later)" ;;
 	*) vcs_label="unchanged" ;;
 	esac
 
 	say "  target directory : $ROOT"
+	local ci_label
+	case "$CI_PLATFORM" in
+	gitlab) ci_label="GitLab — .gitlab-ci.yml + child pipeline" ;;
+	github) ci_label="GitHub — .github/workflows/" ;;
+	both) ci_label="GitLab and GitHub, both written" ;;
+	none) ci_label="none — manual make plan / make apply" ;;
+	esac
+
 	say "  version control  : $vcs_label"
+	say "  review pipeline  : $ci_label"
 	say "  state backend    : $backend_label"
 	say "  example data     : $([ "$WITH_EXAMPLES" = 1 ] && echo 'yes' || echo 'no')"
 	say "  git init         : $([ "$WITH_GIT" = 1 ] && echo 'yes' || echo 'no')"
@@ -542,6 +613,17 @@ while [ $# -gt 0 ]; do
 		BACKEND="${1#*=}"
 		shift
 		;;
+	--ci)
+		[ $# -ge 2 ] || die "--ci requires a value"
+		CI_PLATFORM="$2"
+		CI_EXPLICIT=1
+		shift 2
+		;;
+	--ci=*)
+		CI_PLATFORM="${1#*=}"
+		CI_EXPLICIT=1
+		shift
+		;;
 	--vcs)
 		[ $# -ge 2 ] || die "--vcs requires a value"
 		VCS="$2"
@@ -554,12 +636,13 @@ while [ $# -gt 0 ]; do
 	--git-remote)
 		[ $# -ge 2 ] || die "--git-remote requires a URL"
 		GIT_REMOTE="$2"
-		VCS=git
+		# Only a default: an explicit --vcs, before or after, still wins.
+		[ "$VCS" = ask ] && VCS=gitlab
 		shift 2
 		;;
 	--git-remote=*)
 		GIT_REMOTE="${1#*=}"
-		VCS=git
+		[ "$VCS" = ask ] && VCS=gitlab
 		shift
 		;;
 	--git-branch)
@@ -627,16 +710,66 @@ done
 
 VCS="$(printf '%s' "$VCS" | tr '[:upper:]' '[:lower:]')"
 case "$VCS" in
-gitlab | docker | local-gitlab) VCS=gitlab-docker ;;
-local | none | no | skip) VCS=none ;;
+docker | local-gitlab | gitlab-local) VCS=gitlab-docker ;;
+gh) VCS=github ;;
+local | no | skip) VCS=none ;;
 esac
 case "$VCS" in
-ask | none | git | gitlab-docker) ;;
+ask | none | git | github | gitlab | gitlab-docker) ;;
 *) die "unknown --vcs: $VCS
-       Expected: git (an existing repository), gitlab-docker (stand one up
-       locally), or none (no versioning; migrate later with
-       scripts/enable-gitops.sh)" ;;
+       Expected one of:
+         gitlab         an existing GitLab; full pipeline (the default)
+         gitlab-docker  stand GitLab up locally in Docker, set everything up
+         github         GitHub; workflows written for you to wire up
+         git            another git host; CI files written, you wire them up
+         none           no versioning, no pipeline, manual apply" ;;
 esac
+
+# What was chosen last time. Without this, re-running in an existing tree would
+# quietly fall back to the defaults and start writing pipeline files somebody
+# deliberately did not want — the opposite of what a re-run should do.
+CONF="$ROOT/.nsx-bootstrap.conf"
+if [ -f "$CONF" ]; then
+	# shellcheck disable=SC1090
+	. "$CONF" 2>/dev/null || warn "could not read $CONF; using defaults"
+	[ "$VCS" = ask ] && [ -n "${SAVED_VCS:-}" ] && VCS="$SAVED_VCS"
+	[ "$CI_EXPLICIT" = 0 ] && [ -n "${SAVED_CI_PLATFORM:-}" ] && {
+		CI_PLATFORM="$SAVED_CI_PLATFORM"
+		CI_EXPLICIT=1 # a saved answer is an answer; do not re-derive over it
+	}
+	[ -z "$GIT_REMOTE" ] && GIT_REMOTE="${SAVED_GIT_REMOTE:-}"
+	[ "$GIT_BRANCH" = main ] && [ -n "${SAVED_GIT_BRANCH:-}" ] && GIT_BRANCH="$SAVED_GIT_BRANCH"
+	[ "$BACKEND" = local ] && [ -n "${SAVED_BACKEND:-}" ] && BACKEND="$SAVED_BACKEND"
+fi
+
+# The pipeline follows the host, unless --ci said otherwise.
+if [ "$CI_EXPLICIT" = 0 ]; then
+	case "$VCS" in
+	gitlab | gitlab-docker) CI_PLATFORM=gitlab ;;
+	github) CI_PLATFORM=github ;;
+	git) CI_PLATFORM=both ;;
+	none) CI_PLATFORM=none ;;
+	esac
+fi
+
+CI_PLATFORM="$(printf '%s' "$CI_PLATFORM" | tr '[:upper:]' '[:lower:]')"
+case "$CI_PLATFORM" in
+all) CI_PLATFORM=both ;;
+no | skip | manual) CI_PLATFORM=none ;;
+esac
+case "$CI_PLATFORM" in
+gitlab | github | both | none) ;;
+*) die "unknown --ci: $CI_PLATFORM (expected gitlab, github, both or none)" ;;
+esac
+
+# Answers true when the named platform's pipeline should be written.
+wants_ci() {
+	case "$CI_PLATFORM" in
+	both) return 0 ;;
+	"$1") return 0 ;;
+	*) return 1 ;;
+	esac
+}
 
 # The menu runs on --interactive, or when invoked bare with a terminal present.
 # A single flag suppresses it: flags mean a script, and a script must not block.
@@ -888,9 +1021,12 @@ for d in \
 	data/groups data/policies data/services data/schema data/network data/platform data/vm-tags \
 	modules/dfw-policy modules/group modules/service modules/segment modules/tier1 modules/tier0 modules/vm-tags \
 	stacks/global-security stacks/local-security stacks/local-network stacks/platform stacks/local-tags \
-	envs scripts docs deploy/gitlab .github/workflows; do
+	envs scripts docs deploy/gitlab; do
 	make_dir "$d"
 done
+wants_ci gitlab && make_dir .gitlab/merge_request_templates
+wants_ci github && make_dir .github/workflows
+true # the two above are conditional; do not let the last one set the status
 log ""
 
 log "files"
@@ -1427,6 +1563,24 @@ Four of those live on the git host rather than in this repository. Setting them
 is part of the job — a pipeline without branch protection is a pipeline that
 anybody can bypass by pushing to the default branch.
 
+## Which pipeline you get
+
+Chosen at first run and recorded in `.nsx-bootstrap.conf`, so a later re-run
+does not quietly change it.
+
+| Choice | Written | Set up for you |
+|---|---|---|
+| **GitLab** *(default)* | `.gitlab-ci.yml`, the child-pipeline generator, an MR template | repository, runner, variables and gate, if you let it |
+| GitHub | `.github/workflows/{validate,plan,apply}.yml`, a PR template | nothing — you set the secrets and protect the environments |
+| Another git host | both of the above | nothing; point your host at whichever it reads |
+| Local only | nothing | nothing — `make plan` / `make apply` by hand |
+
+GitLab is the default because it is the only one this script can take all the
+way: `scripts/gitlab-up.sh` will stand the server up, create the project, push,
+register a runner and print the root password. For GitHub the workflows are
+correct and complete, but the secrets and the environment protection are yours
+to set, and nothing here can do it for you.
+
 ## Setting it up
 
 Three ways in, all producing the same pipeline:
@@ -1530,13 +1684,32 @@ apply.
 Everything else — fmt, validate, data schema checks, plan on every request, the
 comment, the merge — is the diagram.
 
-## When there is no pipeline yet
+## Local only — the manual path
 
-`make plan` and `make apply` still work from a workstation, and `scripts/tf.sh`
-enforces the same rules the pipeline relies on: a saved plan, `APPROVE=yes`, and
-a refusal to apply through the placeholder local backend. That is the fallback
-for an incident, not the daily path — a workstation apply leaves no record of
-who approved what.
+If you chose local files, there is no pipeline and no merge request. The
+workflow is:
+
+```bash
+make validate                                    # schemas and conventions
+make plan  STACK=local-security SITE=lon1        # writes a saved plan
+make show  STACK=local-security SITE=lon1        # read it — this is the review
+APPROVE=yes make apply STACK=local-security SITE=lon1
+```
+
+`scripts/tf.sh` still enforces what the pipeline relies on: no apply without a
+saved plan, no apply without an explicit `APPROVE=yes`, and no apply through the
+placeholder local backend. So the *shape* of the review survives even with
+nobody to review it.
+
+What is missing is the record. Nothing says who changed a rule, when, or why,
+and the plan is read by the same person who wrote the change. For a lab that is
+fine. For a production firewall it is the thing an audit will ask about first.
+
+`scripts/enable-gitops.sh` adds all of it later, including writing the pipeline
+files that were skipped. Nothing about the Terraform changes.
+
+Even with a pipeline, this remains the incident path — a workstation apply when
+CI is down. It leaves no record of who approved what, so it is the exception.
 SCAFFOLD_EOF
 
 write_file docs/TAGGING.md <<'SCAFFOLD_EOF'
@@ -7125,6 +7298,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE=""
 LOCAL_GITLAB=0
 BRANCH="${GIT_BRANCH:-main}"
+PLATFORM=gitlab   # gitlab | github | both
 
 die() {
 	printf 'error: %s\n' "$*" >&2
@@ -7146,6 +7320,14 @@ while [ $# -gt 0 ]; do
 		LOCAL_GITLAB=1
 		shift
 		;;
+	--ci)
+		PLATFORM="${2:?--ci needs gitlab, github or both}"
+		shift 2
+		;;
+	--ci=*)
+		PLATFORM="${1#*=}"
+		shift
+		;;
 	--branch)
 		BRANCH="${2:?--branch needs a name}"
 		shift 2
@@ -7158,7 +7340,25 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# A tree set up as local-only has no pipeline definitions, because it asked for
+# none. Adding version control without them would leave nothing to review, so
+# write them first — bootstrap.sh never overwrites, so this only fills gaps.
+ensure_pipeline() {
+	local platform="${1:-gitlab}"
+	if [ "$platform" = gitlab ] && [ -f "$REPO_ROOT/.gitlab-ci.yml" ]; then return 0; fi
+	if [ "$platform" = github ] && [ -d "$REPO_ROOT/.github/workflows" ] &&
+		[ -n "$(ls -A "$REPO_ROOT/.github/workflows" 2>/dev/null)" ]; then return 0; fi
+	[ -x "$REPO_ROOT/scripts/bootstrap.sh" ] || {
+		say "note: scripts/bootstrap.sh is missing, so the $platform pipeline could not be written."
+		return 0
+	}
+	say "writing the $platform pipeline (none present)..."
+	"$REPO_ROOT/scripts/bootstrap.sh" --dir "$REPO_ROOT" --ci "$platform" --quiet </dev/null ||
+		say "note: could not write the pipeline; run scripts/bootstrap.sh --ci $platform by hand."
+}
+
 if [ "$LOCAL_GITLAB" = 1 ]; then
+	ensure_pipeline gitlab
 	exec "$REPO_ROOT/scripts/gitlab-up.sh"
 fi
 
@@ -7180,11 +7380,29 @@ if [ -z "$REMOTE" ]; then
 		printf 'Remote URL (git@host:group/repo.git or https://...): '
 		IFS= read -r REMOTE </dev/tty || REMOTE=""
 		[ -n "$REMOTE" ] || die "no URL given."
+		printf 'Pipeline — 1) GitLab  2) GitHub  3) both [1]: '
+		IFS= read -r plat </dev/tty || plat=""
+		case "${plat:-1}" in
+		2) PLATFORM=github ;;
+		3) PLATFORM=both ;;
+		*) PLATFORM=gitlab ;;
+		esac
 		;;
-	2) exec "$REPO_ROOT/scripts/gitlab-up.sh" ;;
+	2)
+		ensure_pipeline gitlab
+		exec "$REPO_ROOT/scripts/gitlab-up.sh"
+		;;
 	*) die "cancelled." ;;
 	esac
 fi
+
+case "$PLATFORM" in
+both)
+	ensure_pipeline gitlab
+	ensure_pipeline github
+	;;
+*) ensure_pipeline "$PLATFORM" ;;
+esac
 
 # --- git init, commit, remote ----------------------------------------------
 
@@ -7242,6 +7460,40 @@ docs/GITOPS.md is the whole flow, including who approves what.
 NEXT
 SCAFFOLD_EOF
 mark_executable scripts/enable-gitops.sh
+
+if wants_ci gitlab; then
+
+write_file .gitlab/merge_request_templates/nsx-change.md <<'SCAFFOLD_EOF'
+## What changed
+
+<!-- One site or one application per merge request. One spanning several sites
+     cannot be rolled back cleanly. -->
+
+## Change class
+
+- [ ] **Routine** — rule added/removed in an existing policy, or a member added
+      to a static group
+- [ ] **Elevated** — new policy or category, new or changed group criteria, new
+      segment, new tag scope
+- [ ] **Restricted** — default rule, Emergency category, tag scope rename or
+      removal, GM/LM ownership move, anything in `platform`
+
+Ticket:
+
+## Plan review — read the PLAN, not the YAML
+
+The pipeline posts a plan per manager onto this merge request.
+
+- [ ] The resource **count delta** matches the intent
+- [ ] **No unexpected destroys** — a destroy on an untouched rule means keys shifted
+- [ ] No change to the **default rule** and none to the Emergency category
+- [ ] Every new or changed rule has a **non-empty `scope`**
+- [ ] Group criteria changes: **membership blast radius** checked in NSX *before* approval
+- [ ] Sequence numbers do not collide and preserve intended ordering
+- [ ] The change touches **one site's state**, unless deliberately global
+
+## Rollback
+SCAFFOLD_EOF
 
 write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # A rule change is a merge request, and the plan is the review artifact.
@@ -7459,6 +7711,8 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-child-pipeline.py
 
+fi # wants_ci gitlab
+
 write_file scripts/post-plan-comment.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -7569,6 +7823,8 @@ else
 fi
 SCAFFOLD_EOF
 mark_executable scripts/post-plan-comment.sh
+
+if wants_ci github; then
 
 write_file .github/workflows/validate.yml <<'SCAFFOLD_EOF'
 # Runs on every pull request. No credentials, no network access to any manager:
@@ -7837,6 +8093,8 @@ Ticket:
 
 ## Rollback
 SCAFFOLD_EOF
+
+fi # wants_ci github
 
 write_file inventory/README.md <<'SCAFFOLD_EOF'
 # inventory
@@ -8481,7 +8739,15 @@ if [ "$DRY_RUN" != 1 ]; then
 	done
 fi
 
-if { [ "$WITH_GIT" = 1 ] || [ "$VCS" = git ] || [ "$VCS" = gitlab-docker ]; } && [ "$DRY_RUN" != 1 ]; then
+# Any version-control choice implies a working tree; only 'none' does not.
+vcs_wants_git() {
+	case "$VCS" in
+	git | github | gitlab | gitlab-docker) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+if { [ "$WITH_GIT" = 1 ] || vcs_wants_git; } && [ "$DRY_RUN" != 1 ]; then
 	if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
 		log ""
 		log "git: already a working tree, left alone"
@@ -8493,6 +8759,22 @@ if { [ "$WITH_GIT" = 1 ] || [ "$VCS" = git ] || [ "$VCS" = gitlab-docker ]; } &&
 	fi
 fi
 
+# Remember the answers, so a later bare re-run does not quietly change the shape
+# of the tree. Written last, once everything has succeeded.
+if [ "$DRY_RUN" != 1 ]; then
+	{
+		printf '# Written by scripts/bootstrap.sh. Read on re-run so the answers\n'
+		printf '# given once are not silently re-derived from the defaults.\n'
+		printf '# Safe to edit; safe to delete (you just get asked again).\n'
+		printf 'SAVED_VCS=%s\n' "$VCS"
+		printf 'SAVED_CI_PLATFORM=%s\n' "$CI_PLATFORM"
+		printf 'SAVED_BACKEND=%s\n' "$BACKEND"
+		printf 'SAVED_GIT_REMOTE=%s\n' "$(printf '%s' "$GIT_REMOTE" | sed "s/'/'\\\\''/g")"
+		printf 'SAVED_GIT_BRANCH=%s\n' "$GIT_BRANCH"
+	} >"$ROOT/.nsx-bootstrap.conf" 2>/dev/null ||
+		warn "could not write $ROOT/.nsx-bootstrap.conf; re-runs will use the defaults"
+fi
+
 # --- what the version-control choice actually does -------------------------
 #
 # Deliberately after every file is written, and never in a dry run. Generation
@@ -8502,7 +8784,7 @@ fi
 
 if [ "$DRY_RUN" != 1 ]; then
 	case "$VCS" in
-	git)
+	git | github | gitlab)
 		if [ -n "$GIT_REMOTE" ]; then
 			if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
 				log "git: 'origin' already set to $(git -C "$ROOT" remote get-url origin), left alone"
@@ -8517,6 +8799,12 @@ if [ "$DRY_RUN" != 1 ]; then
 			log "  then protect '$GIT_BRANCH', require an approval, and set the CI"
 			log "  variables listed in docs/GITOPS.md."
 		fi
+		log ""
+		log "your CI definitions are here — point your host at them:"
+		wants_ci gitlab && log "  .gitlab-ci.yml            GitLab (child pipeline: scripts/gitlab-child-pipeline.py)"
+		wants_ci github && log "  .github/workflows/        validate.yml, plan.yml, apply.yml"
+		[ "$CI_PLATFORM" = none ] && log "  (none written — re-run with --ci gitlab or --ci github)"
+		true
 		;;
 	gitlab-docker)
 		log ""
@@ -8534,9 +8822,19 @@ if [ "$DRY_RUN" != 1 ]; then
 		;;
 	none)
 		log ""
-		log "no version control configured. Nothing records who changed a firewall"
-		log "rule or why, and there is no plan for anyone to approve."
-		log "When you want that:  scripts/enable-gitops.sh"
+		log "local files only — no version control and no pipeline."
+		log ""
+		log "the manual workflow, which is what you have:"
+		log "    make validate                              schemas and conventions"
+		log "    make plan  STACK=local-security SITE=lon1  writes a saved plan"
+		log "    make show  STACK=local-security SITE=lon1  read it before applying"
+		log "    APPROVE=yes make apply STACK=local-security SITE=lon1"
+		log ""
+		log "apply still refuses without a saved plan and without APPROVE=yes, so"
+		log "the review step survives even with nobody to review it. What is missing"
+		log "is the record: nothing says who changed a rule, when, or why."
+		log ""
+		log "when you want that:  scripts/enable-gitops.sh"
 		;;
 	esac
 fi

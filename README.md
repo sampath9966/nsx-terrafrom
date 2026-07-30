@@ -110,8 +110,19 @@ edit data/policies/payments.yaml
 **The apply never re-plans.** It applies the artifact the approver looked at, so
 what was reviewed is what reaches the firewall.
 
-Both `.gitlab-ci.yml` and `.github/workflows/` are generated every time, so this
-is available whatever you chose at setup. Three ways to turn it on:
+**GitLab is the default**, because it is the only host this script can take all
+the way — server, project, runner, CI variables and the approval gate. GitHub
+gets complete workflows, but its secrets and environment protection are yours to
+set. Local-only writes no pipeline at all and leaves the manual path.
+
+| Choice | Written | Done for you |
+|---|---|---|
+| **GitLab** *(default)* | `.gitlab-ci.yml` + child pipeline + MR template | remote, and optionally the whole server |
+| GitHub | `.github/workflows/{validate,plan,apply}.yml` + PR template | remote only |
+| Another git host | both | remote only; location printed |
+| Local only | nothing | nothing — `make plan` / `make apply` |
+
+Three ways to turn it on:
 
 ```bash
 scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git

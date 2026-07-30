@@ -256,16 +256,55 @@ all. It is **not** irreversible: `.gitlab-ci.yml`, the GitHub workflows and the
 helper scripts are generated whatever you pick, so changing your mind later
 costs one command.
 
-| Choice | Flag | What happens after generation |
-|---|---|---|
-| An existing repository | `--git-remote URL` | `git init` if needed, `origin` attached; you push |
-| Stand up GitLab in Docker | `--vcs gitlab-docker` | GitLab CE and a runner started, project created, pushed, runner registered, initial root password printed |
-| Local files only | `--vcs none` | nothing — and it tells you how to change your mind |
+```
+  1) GitLab   — full CI/CD pipeline, set up for you      (recommended)
+  2) GitHub   — workflows written; you wire them up
+  3) Another git host — CI files written; you wire them up
+  4) Local files only — no versioning, no pipeline, manual apply
+```
 
-Migrating later, from a tree with no versioning:
+| Choice | Flag | Written | Done for you |
+|---|---|---|---|
+| **GitLab** *(default)* | `--vcs gitlab --git-remote URL` | `.gitlab-ci.yml`, child-pipeline generator, MR template | remote attached |
+| GitLab in Docker | `--vcs gitlab-docker` | same | server started, project created, pushed, runner registered, root password printed |
+| GitHub | `--vcs github` | `.github/workflows/{validate,plan,apply}.yml`, PR template | remote attached; **secrets and environment protection are yours** |
+| Another git host | `--vcs git` | both sets | remote attached; their location printed |
+| Local only | `--vcs none` | **nothing** | nothing — `make plan` / `make apply` by hand |
+
+`--ci gitlab\|github\|both\|none` overrides which pipeline is written, if you
+want GitHub workflows on a GitLab remote or anything else unusual.
+
+**GitLab is the default because it is the only one this script can take all the
+way** — server, project, runner, variables and gate. For GitHub the workflows
+are complete and correct, but the repository secrets and the apply environments
+are yours to configure, and nothing here can do it for you.
+
+The choice is recorded in `.nsx-bootstrap.conf`, so a later bare re-run keeps
+it. A tree set up as local-only will not sprout a pipeline because somebody
+re-ran the generator.
+
+#### Local only — the manual path
+
+No pipeline is written at all. The workflow is what it was before CI existed:
+
+```bash
+make validate                                 # schemas and conventions
+make plan  STACK=local-security SITE=lon1     # writes a saved plan
+make show  STACK=local-security SITE=lon1     # read it — this is the review
+APPROVE=yes make apply STACK=local-security SITE=lon1
+```
+
+`scripts/tf.sh` still refuses to apply without a saved plan, without
+`APPROVE=yes`, and through the placeholder local backend — so the shape of the
+review survives even with nobody to review it. What is missing is the record of
+who changed what and why.
+
+Migrating later, from a tree with no versioning — this also **writes the
+pipeline files that were skipped**:
 
 ```bash
 scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --remote git@github.com:org/nsx.git --ci github
 scripts/enable-gitops.sh --local-gitlab
 ```
 
