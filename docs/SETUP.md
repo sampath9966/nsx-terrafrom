@@ -35,23 +35,27 @@ git clone https://github.com/sampath9966/nsx-terrafrom
 With no arguments it asks what you want:
 
 ```
- 1) Basic deployment      — best practices assumed, three questions
+ 1) Basic deployment      — best practices assumed, four questions
  2) Advanced deployment   — every option asked
  3) Update an existing tree
- 4) Dry run               — show what a basic run would write
- 5) Help                  — list every flag
- 6) Quit
+ 4) Add version control and the review pipeline to an existing tree
+ 5) Dry run               — show what a basic run would write
+ 6) Help                  — list every flag
+ 7) Quit
 ```
 
-- **Basic** asks three things: the directory, the state backend, and whether to
-  include the worked example data. Everything else takes the recommended
-  answer — `git init` on a tree that is not already one, and never overwrite.
+- **Basic** asks four things: the directory, **where the files live and how
+  changes get reviewed**, the state backend, and whether to include the worked
+  example data. Everything else takes the recommended answer — `git init` on a
+  tree that is not already one, and never overwrite.
 - **Advanced** asks about every flag, including what the run is allowed to
   overwrite and whether to dry-run first.
 - **Update an existing tree** is the day-two path: it keeps the backend the tree
   already uses, never re-seeds example data, and offers a dry run first.
+- **Add version control and the review pipeline** is the migration path for a
+  tree set up without either.
 
-Both print the equivalent command line before writing anything, so a single pass
+They print the equivalent command line before writing anything, so a single pass
 through the menu gives you the scripted form to put in a runbook.
 
 Everything is also available directly, and **any flag suppresses the menu** —
@@ -245,7 +249,71 @@ Not to this repository, not to another one, GitLab or otherwise:
 a different mechanism — an API GitLab hosts, not a file in a repository — and it
 is the right way to keep state in GitLab.
 
-### 2.2 Credentials — blocking
+### 2.2 Where the files live, and how changes get reviewed — first-run decision
+
+Asked at first run because it decides whether a firewall change is reviewable at
+all. It is **not** irreversible: `.gitlab-ci.yml`, the GitHub workflows and the
+helper scripts are generated whatever you pick, so changing your mind later
+costs one command.
+
+| Choice | Flag | What happens after generation |
+|---|---|---|
+| An existing repository | `--git-remote URL` | `git init` if needed, `origin` attached; you push |
+| Stand up GitLab in Docker | `--vcs gitlab-docker` | GitLab CE and a runner started, project created, pushed, runner registered, initial root password printed |
+| Local files only | `--vcs none` | nothing — and it tells you how to change your mind |
+
+Migrating later, from a tree with no versioning:
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab
+```
+
+It refuses to commit if a state or plan file is present, and refuses outright if
+`.gitignore` does not exclude `*.tfstate` — committing state is the one mistake
+with no clean undo.
+
+#### What the pipeline gives you
+
+```
+edit data/policies/payments.yaml
+  -> push, open a merge request
+  -> VALIDATE  schemas and conventions, offline, no credentials
+  -> PLAN      one job per manager, READ-ONLY credentials,
+               rendered plan posted onto the merge request
+  -> APPROVER  reads the plan, approves
+  -> MERGE     to the default branch
+  -> APPLY     MANUAL job, protected environment, applies the SAVED plan
+```
+
+**The apply never re-plans.** It applies the artifact the approver looked at, so
+what was reviewed is what reaches the firewall.
+
+Four of the controls live on the git host, not here, and a pipeline without them
+is one anybody can bypass:
+
+- branch protection on the default branch;
+- an approval requirement on merge requests;
+- `VAULT_PLAN_TOKEN` **read-only**, available everywhere;
+- `VAULT_APPLY_TOKEN` write and **protected**, so only protected branches can
+  apply.
+
+`docs/GITOPS.md` in the generated tree has the rest, including what the approver
+is checking.
+
+#### No GitLab? One command
+
+```bash
+scripts/gitlab-up.sh
+```
+
+GitLab CE and a runner in Docker, the project created and pushed, the runner
+registered, and the initial root password printed the way GitLab does it —
+readable again later with `scripts/gitlab-up.sh --password`. Needs Docker and
+about 4 GB of RAM, and first boot takes several minutes. It is a lab instance:
+no TLS, no backups, no HA.
+
+### 2.3 Credentials — blocking
 
 Credentials never live in this repository, and never pass through a Terraform
 data source: the `vault_*` data sources write the fetched secret into state in
@@ -256,7 +324,7 @@ in the environment. It assumes Vault KV v2 at the path recorded per manager in
 `inventory/managers.yaml`; the mount convention and auth method are yours to
 set. `vault_path` records **where the credential lives, never the credential**.
 
-### 2.3 Who tags the workloads — decide before writing group criteria
+### 2.4 Who tags the workloads — decide before writing group criteria
 
 Group membership resolves from tags, so this decides whether a membership change
 is reviewable. Two supported variants, covered in full in `docs/TAGGING.md`:
@@ -289,7 +357,7 @@ Mixing is per **VM**, never per tag. The boundary is enforced: every scope in
 `data/schema/tag-scopes.yaml` records its owning system, and `make validate`
 errors if `data/vm-tags/` writes a scope not owned by `terraform`.
 
-### 2.4 The rest
+### 2.5 The rest
 
 | Decision | Default taken | Revisit when |
 |---|---|---|

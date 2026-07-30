@@ -903,6 +903,8 @@ scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
 scripts/bootstrap.sh --confirm TEXT   # the overwrite phrase, for a pipeline
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
+scripts/bootstrap.sh --vcs KIND       # git | gitlab-docker | none
+scripts/bootstrap.sh --git-remote URL # attach 'origin'; implies --vcs git
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
 
@@ -966,10 +968,31 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/tag-vm.py --site S --vm V --set SCOPE=VALUE` | Tags a VM as a data edit on `data/vm-tags/<site>.yaml`. Also `--unset SCOPE`, `--remove`, `--list`, `--dry-run`. Refuses any scope not owned by `terraform` in the vocabulary, and refuses to leave a VM with an empty tag set. |
 | `scripts/import-estate.py --site S [--from-dump F]` | Adopts a live estate: data files, Terraform import blocks, and the import manifest. `--dump-only` captures without converting. Never overwrites — writes `<name>.new` instead. |
 | `scripts/drift.sh STACK SITE` | Refresh-only plan, report to `reports/`. Exit 2 on drift. Never reverts, never writes `data/`. |
+| `scripts/enable-gitops.sh [--remote URL\|--local-gitlab]` | Puts an existing tree under version control and turns on the review pipeline. The migration path for anything set up without it. Refuses to commit if state or plan files are present. |
+| `scripts/gitlab-up.sh [--status\|--password\|--down\|--destroy]` | Brings up GitLab CE and a runner in Docker, creates the project, pushes, registers the runner, prints the initial root password. For teams without a GitLab. Not a production deployment. |
+| `scripts/gitlab-child-pipeline.py` | Emits the per-manager plan/apply jobs for GitLab from the inventory. Plans only on a merge request; plans plus **manual** applies on the default branch. |
+| `scripts/post-plan-comment.sh STACK SITE FILE` | Posts a rendered plan onto the merge request. Never posts the plan file itself. No-op outside an MR or without `CI_API_TOKEN`. |
+| `scripts/ci_matrix_lib.py` | The matrix itself, importable. `ci-matrix.py` and `gitlab-child-pipeline.py` both read it, so GitHub and GitLab cannot drift apart. |
 
 `scripts/validate-data.py` and `scripts/ci-matrix.py` need only Python 3.9+;
 PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
 subset when it is not.
+
+### Review pipeline
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab      # stand GitLab up in Docker
+scripts/gitlab-up.sh --status                # where it is, whether it is up
+scripts/gitlab-up.sh --password              # the initial root password
+python3 scripts/gitlab-child-pipeline.py     # the per-manager jobs, as YAML
+```
+
+A rule edit becomes a merge request, a plan per manager posted onto it, an
+approval, a merge, and a **manual** apply of the plan that was approved — the
+apply never re-plans. `docs/GITOPS.md` is the full flow, including the branch
+protection and CI variables it depends on, which live on the git host rather
+than in this repository.
 
 ### CI
 

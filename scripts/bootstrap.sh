@@ -37,6 +37,13 @@ CONFIRMED=0
 INTERACTIVE=0
 NO_INTERACTIVE=0
 
+# Where the files live and how changes get reviewed. Chosen at first run, and
+# changeable later with scripts/enable-gitops.sh — the pipeline files are always
+# generated, so this only drives what happens after generation.
+VCS=ask          # ask | none | git | gitlab-docker
+GIT_REMOTE=""
+GIT_BRANCH=main
+
 created=0
 updated=0
 unchanged=0
@@ -58,6 +65,24 @@ it teaches the flags below. Any flag on the command line means a script is
 driving, so the menu stays out of the way.
 
 Options:
+      --vcs KIND      Where these files live and how changes are reviewed:
+
+                        git             an existing repository; pass
+                                        --git-remote URL
+                        gitlab-docker   stand up GitLab CE and a runner in
+                                        Docker after generating, create the
+                                        repository, push, and print the initial
+                                        root password
+                        none            local files only; no versioning and no
+                                        review pipeline
+
+                      Changeable later with scripts/enable-gitops.sh: the
+                      pipeline files are generated either way, so this only
+                      decides what happens after generation.
+      --git-remote URL
+                      Remote to attach as 'origin'. Implies --vcs git.
+      --git-branch NAME
+                      Default branch name (default: main).
   -i, --interactive   Force the menu even when other flags are given.
       --no-interactive
                       Never show the menu; use defaults and the flags given.
@@ -211,6 +236,44 @@ ask_menu() {
 	done
 }
 
+# The decision the whole review model rests on. Asked at first run because
+# retrofitting review onto an estate somebody has been hand-editing is harder
+# than starting with it — though scripts/enable-gitops.sh does exactly that, so
+# "decide later" is a real answer rather than a trap.
+wizard_vcs() {
+	local choice
+	choice="$(ask_menu 1 "Where do these files live, and how do changes get reviewed?" \
+		"An existing git repository   — I have the URL" \
+		"Stand up GitLab locally in Docker and create the repository" \
+		"Local files only   — no versioning, no review pipeline")"
+	case "$choice" in
+	1)
+		VCS=git
+		GIT_REMOTE="$(ask "  Remote URL (git@host:group/repo.git, or https://...)" "")"
+		[ -n "$GIT_REMOTE" ] || {
+			say "  no URL given; leaving version control for later."
+			VCS=none
+		}
+		[ "$VCS" = git ] && GIT_BRANCH="$(ask "  Default branch" "$GIT_BRANCH")"
+		;;
+	2)
+		VCS=gitlab-docker
+		say ""
+		say "  GitLab CE and a runner will be started in Docker after the files"
+		say "  are written, the repository created and pushed, and the initial"
+		say "  root password printed. First boot takes several minutes."
+		say "  Needs docker and roughly 4 GB of RAM."
+		;;
+	3)
+		VCS=none
+		say ""
+		say "  No versioning, so no review pipeline and no record of who changed"
+		say "  a firewall rule or why. The pipeline files are still written, so"
+		say "  scripts/enable-gitops.sh can turn this on whenever you want."
+		;;
+	esac
+}
+
 wizard_backend() {
 	local choice
 	choice="$(ask_menu 1 "State backend — where Terraform keeps its state." \
@@ -246,6 +309,9 @@ wizard_summary_and_go() {
 
 	local cmd="scripts/bootstrap.sh --dir '$ROOT'"
 	[ "$BACKEND" != local ] && cmd="$cmd --backend $BACKEND"
+	[ "$VCS" = git ] && cmd="$cmd --git-remote '$GIT_REMOTE'"
+	[ "$VCS" = gitlab-docker ] && cmd="$cmd --vcs gitlab-docker"
+	[ "$VCS" = none ] && cmd="$cmd --vcs none"
 	[ "$WITH_EXAMPLES" = 0 ] && cmd="$cmd --no-examples"
 	[ "$WITH_GIT" = 1 ] && cmd="$cmd --git-init"
 	[ "$FORCE_DATA" = 1 ] && cmd="$cmd --force-data"
@@ -254,7 +320,16 @@ wizard_summary_and_go() {
 
 	say ""
 	say "-------------------------------------------------------------------"
+	local vcs_label
+	case "$VCS" in
+	git) vcs_label="git — $GIT_REMOTE (branch $GIT_BRANCH)" ;;
+	gitlab-docker) vcs_label="GitLab in Docker, started after generation" ;;
+	none) vcs_label="local files only — no review pipeline (migrate later)" ;;
+	*) vcs_label="unchanged" ;;
+	esac
+
 	say "  target directory : $ROOT"
+	say "  version control  : $vcs_label"
 	say "  state backend    : $backend_label"
 	say "  example data     : $([ "$WITH_EXAMPLES" = 1 ] && echo 'yes' || echo 'no')"
 	say "  git init         : $([ "$WITH_GIT" = 1 ] && echo 'yes' || echo 'no')"
@@ -271,8 +346,9 @@ wizard_summary_and_go() {
 
 wizard_basic() {
 	say ""
-	say "Basic — best practices assumed. Three questions."
+	say "Basic — best practices assumed. Four questions."
 	ROOT="$(ask "Directory to create the repository in" "$ROOT")"
+	wizard_vcs
 	wizard_backend
 	if ask_yes_no "Include worked example data? (recommended the first time)" y; then
 		WITH_EXAMPLES=1
@@ -288,6 +364,7 @@ wizard_advanced() {
 	say ""
 	say "Advanced — every option."
 	ROOT="$(ask "Directory to create the repository in" "$ROOT")"
+	wizard_vcs
 	wizard_backend
 
 	if ask_yes_no "Include worked example data? (4 managers, 10 groups, 4 policy files)" y; then
@@ -365,6 +442,28 @@ wizard_update() {
 	wizard_summary_and_go
 }
 
+# The migration path for a tree set up without versioning. Hands off to the
+# generated script rather than duplicating it, so there is one implementation.
+wizard_migrate() {
+	say ""
+	say "Add version control and the review pipeline to an existing tree."
+	ROOT="$(ask "Directory of the existing repository" "$ROOT")"
+	[ -d "$ROOT" ] || die "$ROOT does not exist. Use option 1 or 2 to create a new tree."
+
+	if [ ! -x "$ROOT/scripts/enable-gitops.sh" ]; then
+		say ""
+		say "  That tree predates the migration script. Refreshing the generator's"
+		say "  own output first — your data is not touched."
+		FORCE=1
+		return 0
+	fi
+
+	say ""
+	say "  Handing over to $ROOT/scripts/enable-gitops.sh"
+	say ""
+	exec "$ROOT/scripts/enable-gitops.sh"
+}
+
 run_wizard() {
 	say ""
 	say "==================================================================="
@@ -373,9 +472,10 @@ run_wizard() {
 
 	local choice
 	choice="$(ask_menu 1 "What would you like to do?" \
-		"Basic deployment      — best practices assumed, three questions" \
+		"Basic deployment      — best practices assumed, four questions" \
 		"Advanced deployment   — every option asked" \
 		"Update an existing tree" \
+		"Add version control and the review pipeline to an existing tree" \
 		"Dry run               — show what a basic run would write" \
 		"Help                  — list every flag" \
 		"Quit")"
@@ -384,15 +484,16 @@ run_wizard() {
 	1) wizard_basic ;;
 	2) wizard_advanced ;;
 	3) wizard_update ;;
-	4)
+	4) wizard_migrate ;;
+	5)
 		DRY_RUN=1
 		wizard_basic
 		;;
-	5)
+	6)
 		usage
 		exit 0
 		;;
-	6)
+	7)
 		say "nothing written."
 		exit 0
 		;;
@@ -439,6 +540,35 @@ while [ $# -gt 0 ]; do
 		;;
 	--backend=*)
 		BACKEND="${1#*=}"
+		shift
+		;;
+	--vcs)
+		[ $# -ge 2 ] || die "--vcs requires a value"
+		VCS="$2"
+		shift 2
+		;;
+	--vcs=*)
+		VCS="${1#*=}"
+		shift
+		;;
+	--git-remote)
+		[ $# -ge 2 ] || die "--git-remote requires a URL"
+		GIT_REMOTE="$2"
+		VCS=git
+		shift 2
+		;;
+	--git-remote=*)
+		GIT_REMOTE="${1#*=}"
+		VCS=git
+		shift
+		;;
+	--git-branch)
+		[ $# -ge 2 ] || die "--git-branch requires a name"
+		GIT_BRANCH="$2"
+		shift 2
+		;;
+	--git-branch=*)
+		GIT_BRANCH="${1#*=}"
 		shift
 		;;
 	-i | --interactive)
@@ -494,6 +624,19 @@ while [ $# -gt 0 ]; do
 		die "unknown option: $1 (try --help)" ;;
 	esac
 done
+
+VCS="$(printf '%s' "$VCS" | tr '[:upper:]' '[:lower:]')"
+case "$VCS" in
+gitlab | docker | local-gitlab) VCS=gitlab-docker ;;
+local | none | no | skip) VCS=none ;;
+esac
+case "$VCS" in
+ask | none | git | gitlab-docker) ;;
+*) die "unknown --vcs: $VCS
+       Expected: git (an existing repository), gitlab-docker (stand one up
+       locally), or none (no versioning; migrate later with
+       scripts/enable-gitops.sh)" ;;
+esac
 
 # The menu runs on --interactive, or when invoked bare with a terminal present.
 # A single flag suppresses it: flags mean a script, and a script must not block.
@@ -745,7 +888,7 @@ for d in \
 	data/groups data/policies data/services data/schema data/network data/platform data/vm-tags \
 	modules/dfw-policy modules/group modules/service modules/segment modules/tier1 modules/tier0 modules/vm-tags \
 	stacks/global-security stacks/local-security stacks/local-network stacks/platform stacks/local-tags \
-	envs scripts docs .github/workflows; do
+	envs scripts docs deploy/gitlab .github/workflows; do
 	make_dir "$d"
 done
 log ""
@@ -1153,6 +1296,8 @@ describing no real site. Replace it, or regenerate with `--no-examples`.
 | `docs/TAGGING.md` | Who applies tags: the two variants, the ownership constraint, how the boundary is enforced. |
 | `docs/IMPORT.md` | Adopting an estate that already exists — the tranche workflow. |
 | `docs/SETUP.md` | Standing this up end to end: prerequisites, the decisions that are yours, backend choice, first contact with a manager. |
+| `docs/GITOPS.md` | How a rule edit becomes a merge request, a plan, an approval and an apply — and what the approver is looking for. |
+| `deploy/gitlab/README.md` | Running a local GitLab in Docker, if you do not have one. |
 | `modules/*/README.md` | Input shape and gotchas, one per module. |
 | `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
 | `inventory/README.md` | How the manager registry drives everything else. |
@@ -1163,10 +1308,33 @@ By question:
 |---|---|
 | Add a firewall rule | `docs/ARCHITECTURE.md` §8 and §10 |
 | Avoid breaking a live firewall | `docs/ARCHITECTURE.md` §2 |
+| Get changes reviewed before they apply | `docs/GITOPS.md` |
 | Decide who tags workloads | `docs/TAGGING.md` |
 | Adopt an existing estate | `docs/IMPORT.md` |
 | Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
 | Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
+
+## Getting changes reviewed
+
+A rule change should be a merge request, not an edit somebody made on a
+Tuesday. The pipeline files are already here:
+
+```
+edit data/policies/*.yaml -> MR -> validate -> plan posted to the MR
+   -> approver reads the PLAN -> merge -> MANUAL apply of the SAVED plan
+```
+
+The apply never re-plans; it applies the artifact the approver looked at.
+
+If this tree has no remote yet:
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab   # or stand GitLab up in Docker
+```
+
+`docs/GITOPS.md` covers the CI variables, the branch protection this depends on,
+and what the approver is checking.
 
 ## Re-running the generator
 
@@ -1208,6 +1376,122 @@ git is the real undo.
 
 Read `docs/ARCHITECTURE.md` section 2 — ten things that will break this
 repository — before the first change.
+SCAFFOLD_EOF
+
+write_file docs/GITOPS.md <<'SCAFFOLD_EOF'
+# A rule change is a merge request
+
+The point of this repository is that nobody edits the firewall. They edit a
+file, and a pipeline turns that into a plan somebody approves.
+
+```
+  engineer edits data/policies/payments.yaml
+        |
+        v
+  push a branch, open a merge request
+        |
+        v
+  VALIDATE   schemas and conventions. Offline, no credentials.
+  PLAN       one job per manager, READ-ONLY credentials.
+             The rendered plan is posted onto the merge request.
+        |
+        v
+  APPROVER   reads the plan, not the YAML. Count delta, no unexpected
+             destroys, scope set, default rule untouched. Approves.
+        |
+        v
+  MERGE      to the default branch.
+        |
+        v
+  APPLY      a MANUAL job on a protected environment, applying the SAVED
+             plan artifact — never a fresh one.
+```
+
+The last step is the one that matters: **apply never re-plans.** It applies the
+artifact the approver looked at. If the estate drifted in between, the apply
+fails on a stale plan rather than quietly doing something nobody reviewed.
+
+## What makes it safe
+
+| Control | Enforced by |
+|---|---|
+| Nobody can push to the default branch | branch protection, on the git host |
+| A change needs another person | merge request approval rules |
+| Plans cannot write | `VAULT_PLAN_TOKEN` is read-only |
+| Only protected branches can write | `VAULT_APPLY_TOKEN` marked **protected** |
+| Apply needs a human | manual job + protected environment |
+| Apply cannot re-plan | `scripts/tf.sh apply` refuses without a saved plan and `APPROVE=yes` |
+| Bad data never reaches a plan | `scripts/validate-data.py` in the validate stage |
+
+Four of those live on the git host rather than in this repository. Setting them
+is part of the job — a pipeline without branch protection is a pipeline that
+anybody can bypass by pushing to the default branch.
+
+## Setting it up
+
+Three ways in, all producing the same pipeline:
+
+```bash
+# 1. an existing repository
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx-terraform.git
+
+# 2. no GitLab yet — stand one up in Docker
+scripts/enable-gitops.sh --local-gitlab      # or scripts/gitlab-up.sh
+
+# 3. at first run
+scripts/bootstrap.sh                          # the menu asks
+```
+
+Nothing in the repository changes between them: `.gitlab-ci.yml`,
+`.github/workflows/` and the helper scripts are always generated. Choosing later
+costs nothing, which is why "local only, decide later" is a supported answer
+rather than a trap.
+
+### CI variables
+
+| Variable | Value | Flags |
+|---|---|---|
+| `VAULT_ADDR` | Vault endpoint | masked |
+| `VAULT_PLAN_TOKEN` | **read-only** token | masked |
+| `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
+| `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
+
+If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
+and the approver reads the plan in the job log instead.
+
+## How the per-manager jobs appear
+
+GitLab cannot build a job matrix from a file at parse time, so
+`scripts/gitlab-child-pipeline.py` reads `inventory/managers.yaml` and emits the
+jobs as a child pipeline. Adding an eleventh Local Manager stays a data change:
+add it to the inventory, and its plan job appears on the next merge request.
+
+GitHub Actions does the same thing with `scripts/ci-matrix.py --format github`.
+Both read the same `scripts/ci_matrix_lib.py`, so the two platforms cannot drift
+apart.
+
+## The approver's job
+
+Read the **plan**, not the diff. The YAML says what somebody intended; the plan
+says what Terraform will do.
+
+- **Resource count delta matches the intent.** One rule added should not be
+  fourteen resources changed.
+- **No unexpected destroys.** A destroy on a rule nobody touched means map keys
+  shifted — stop and find out why before approving.
+- **`scope` is set on everything new or changed.** An unscoped rule goes to every
+  hypervisor in the span.
+- **The default rule and the Emergency category are untouched**, unless that is
+  explicitly what the change is for, in which case it is a restricted change and
+  needs the change advisory (`docs/ARCHITECTURE.md` §11).
+
+## When there is no pipeline yet
+
+`make plan` and `make apply` still work from a workstation, and `scripts/tf.sh`
+enforces the same rules the pipeline relies on: a saved plan, `APPROVE=yes`, and
+a refusal to apply through the placeholder local backend. That is the fallback
+for an incident, not the daily path — a workstation apply leaves no record of
+who approved what.
 SCAFFOLD_EOF
 
 write_file docs/TAGGING.md <<'SCAFFOLD_EOF'
@@ -1401,8 +1685,12 @@ stacks/
   local-network/           Per-LM: segments, T1s. One state per LM.
   platform/                Per-LM: T0, transport zones, edge clusters.
 envs/<site>.backend.hcl    Partial backend config, one file per manager.
-scripts/                   Bootstrap, validation, CI matrix, credential handling.
-.github/workflows/         Validate on every PR; plan per site from the matrix.
+scripts/                   Bootstrap, validation, CI matrix, credential handling,
+                           estate import, rule and tag edits, GitOps setup.
+deploy/gitlab/             A local GitLab in Docker, for teams without one.
+                           Not a production deployment.
+.gitlab-ci.yml             MR -> validate -> plan -> approve -> merge -> apply.
+.github/workflows/         The same flow on GitHub Actions.
 ```
 
 ## Why the split
@@ -4020,6 +4308,65 @@ exec "$@"
 SCAFFOLD_EOF
 mark_executable scripts/with-credentials.sh
 
+write_file scripts/ci_matrix_lib.py <<'SCAFFOLD_EOF'
+"""The run matrix, derived from inventory/managers.yaml.
+
+Importable, unlike scripts/ci-matrix.py, whose hyphen keeps it out of reach of
+an import statement. Everything that needs to know which stacks run against
+which managers comes through here, so there is one definition and not three:
+scripts/ci-matrix.py for humans and GitHub Actions, and
+scripts/gitlab-child-pipeline.py for GitLab.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from yamlcompat import load_yaml  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
+
+# A Global Manager has no VM inventory and no local networking, so local-tags,
+# local-network and platform are Local Manager stacks only.
+GM_STACKS = ["global-security"]
+LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
+
+
+def managers(strict: bool = True) -> dict:
+    if not INVENTORY.exists():
+        if strict:
+            sys.exit(f"error: {INVENTORY} does not exist")
+        return {}
+    doc = load_yaml(INVENTORY.read_text()) or {}
+    return doc.get("managers") or {}
+
+
+def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]:
+    out = []
+    for name, m in sorted(managers(strict=strict).items()):
+        if m.get("enabled") is False:
+            continue
+        role = m.get("role", "lm")
+        allowed = m.get("stacks") or (GM_STACKS if role == "gm" else LM_STACKS)
+        for stack in allowed:
+            if stack_filter and stack != stack_filter:
+                continue
+            out.append(
+                {
+                    "site": name,
+                    "stack": stack,
+                    "role": role,
+                    "host": m.get("host", ""),
+                    "tier": m.get("tier", ""),
+                    "vcf_instance": m.get("vcf_instance", ""),
+                }
+            )
+    return out
+SCAFFOLD_EOF
+
 write_file scripts/ci-matrix.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
 """Derive the run matrix from inventory/managers.yaml.
@@ -4042,43 +4389,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
-
-GM_STACKS = ["global-security"]
-LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
-
-
-def managers() -> dict:
-    if not INVENTORY.exists():
-        sys.exit(f"error: {INVENTORY} does not exist")
-    doc = load_yaml(INVENTORY.read_text()) or {}
-    return doc.get("managers") or {}
-
-
-def entries(stack_filter: str | None) -> list[dict]:
-    out = []
-    for name, m in sorted(managers().items()):
-        if m.get("enabled") is False:
-            continue
-        role = m.get("role", "lm")
-        allowed = m.get("stacks") or (GM_STACKS if role == "gm" else LM_STACKS)
-        for stack in allowed:
-            if stack_filter and stack != stack_filter:
-                continue
-            out.append(
-                {
-                    "site": name,
-                    "stack": stack,
-                    "role": role,
-                    "host": m.get("host", ""),
-                    "tier": m.get("tier", ""),
-                    "vcf_instance": m.get("vcf_instance", ""),
-                }
-            )
-    return out
+from ci_matrix_lib import entries, managers  # noqa: E402
 
 
 def export(site: str) -> int:
@@ -4110,7 +4421,9 @@ def main() -> int:
     if args.export:
         return export(args.export)
 
-    rows = entries(args.stack)
+    # Strict here: a human or a GitHub matrix asking for the inventory when it
+    # does not exist is an error, not an empty list.
+    rows = entries(args.stack, strict=True)
     if args.format == "lines":
         for r in rows:
             print(f"{r['site']}\t{r['stack']}\t{r['role']}\t{r['host']}")
@@ -6380,6 +6693,777 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 # acceptable for a lab, not for a managed estate.
 SCAFFOLD_EOF
 
+write_file deploy/gitlab/docker-compose.yml <<'SCAFFOLD_EOF'
+# A self-contained GitLab for running this repository's review pipeline, for
+# teams that do not already have one. Brought up by scripts/gitlab-up.sh.
+#
+# NOT a production GitLab. No TLS, no backups, no HA, and the runner is
+# privileged so it can run Docker-in-Docker. Fine for a lab or a pilot; put a
+# real one in front of a production estate.
+#
+# Data lives in named volumes, so 'docker compose down' keeps everything and
+# 'docker compose down -v' destroys it.
+
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:17.5.2-ce.0
+    container_name: nsx-gitlab
+    restart: unless-stopped
+    hostname: "${GITLAB_HOST:-localhost}"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://${GITLAB_HOST:-localhost}:${GITLAB_PORT:-8929}'
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2224}
+        # A lab instance does not need mail, metrics or the container registry.
+        registry['enable'] = false
+        prometheus_monitoring['enable'] = false
+        grafana['enable'] = false
+        gitlab_rails['gitlab_email_enabled'] = false
+        puma['worker_processes'] = 2
+        sidekiq['max_concurrency'] = 9
+    ports:
+      - "${GITLAB_PORT:-8929}:${GITLAB_PORT:-8929}"
+      - "${GITLAB_SSH_PORT:-2224}:22"
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD", "/opt/gitlab/bin/gitlab-healthcheck", "--fail", "--max-time", "10"]
+      interval: 30s
+      timeout: 15s
+      retries: 30
+      start_period: 10m
+
+  runner:
+    image: gitlab/gitlab-runner:v17.5.3
+    container_name: nsx-gitlab-runner
+    restart: unless-stopped
+    depends_on:
+      - gitlab
+    volumes:
+      - gitlab-runner-config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  gitlab-config:
+  gitlab-logs:
+  gitlab-data:
+  gitlab-runner-config:
+SCAFFOLD_EOF
+
+write_file deploy/gitlab/README.md <<'SCAFFOLD_EOF'
+# A local GitLab, for teams that do not have one
+
+`scripts/gitlab-up.sh` brings up GitLab CE and a runner in Docker, waits for it,
+prints the initial root password, creates a project for this repository, pushes
+to it, and registers the runner so the review pipeline works end to end.
+
+```bash
+scripts/gitlab-up.sh              # start, create the project, push
+scripts/gitlab-up.sh --status     # where it is and whether it is healthy
+scripts/gitlab-up.sh --password   # print the initial root password again
+scripts/gitlab-up.sh --down       # stop, keep all data
+scripts/gitlab-up.sh --destroy    # stop and delete the volumes
+```
+
+First boot takes several minutes — GitLab migrates its database before it
+answers. The script waits and tells you what it is waiting for.
+
+## What you get
+
+- GitLab at `http://localhost:8929`, user `root`, password printed by the script
+  and readable again with `--password`.
+- A project containing this repository, with `.gitlab-ci.yml` already in it.
+- A registered runner using the Docker executor.
+
+## What it is not
+
+Not a production GitLab. No TLS, no backups, no HA, and the initial root
+password lives in a file inside the container for 24 hours. Change it at first
+login. For a production estate use a real GitLab and point
+`scripts/enable-gitops.sh` at it instead.
+
+## Before the pipeline can plan against a manager
+
+Set these in the project, under Settings → CI/CD → Variables:
+
+| Variable | Value | Flags |
+|---|---|---|
+| `VAULT_ADDR` | your Vault endpoint | masked |
+| `VAULT_PLAN_TOKEN` | a **read-only** token | masked |
+| `VAULT_APPLY_TOKEN` | a write token | masked, **protected** |
+| `CI_API_TOKEN` | project token, `api` scope — lets the pipeline post plans to the MR | masked |
+
+`VAULT_APPLY_TOKEN` must be protected, so it is only available on protected
+branches. That is what stops a feature branch from applying anything.
+SCAFFOLD_EOF
+
+write_file scripts/gitlab-up.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Stand up a local GitLab in Docker and put this repository in it.
+#
+#   scripts/gitlab-up.sh              start, create the project, push
+#   scripts/gitlab-up.sh --status     report where it is and whether it is up
+#   scripts/gitlab-up.sh --password   print the initial root password
+#   scripts/gitlab-up.sh --down       stop, keep the data
+#   scripts/gitlab-up.sh --destroy    stop and delete the data
+#
+# For teams with no GitLab of their own. Everything it needs is in
+# deploy/gitlab/docker-compose.yml. Not a production deployment — see
+# deploy/gitlab/README.md.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_DIR="$REPO_ROOT/deploy/gitlab"
+GITLAB_HOST="${GITLAB_HOST:-localhost}"
+GITLAB_PORT="${GITLAB_PORT:-8929}"
+GITLAB_URL="http://${GITLAB_HOST}:${GITLAB_PORT}"
+PROJECT_NAME="${GITLAB_PROJECT:-nsx-terraform}"
+WAIT_MINUTES="${GITLAB_WAIT_MINUTES:-15}"
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+
+compose() {
+	if docker compose version >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && GITLAB_HOST="$GITLAB_HOST" GITLAB_PORT="$GITLAB_PORT" docker compose "$@")
+	elif command -v docker-compose >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && GITLAB_HOST="$GITLAB_HOST" GITLAB_PORT="$GITLAB_PORT" docker-compose "$@")
+	else
+		die "neither 'docker compose' nor 'docker-compose' is available."
+	fi
+}
+
+preflight() {
+	command -v docker >/dev/null 2>&1 || die "docker is not installed. See https://docs.docker.com/engine/install/"
+	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon. Is it running, and is your user in the docker group?"
+	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing. Re-run scripts/bootstrap.sh."
+
+	# GitLab is not small. Warn rather than refuse: the numbers below are what
+	# it needs to be usable, not what it needs to boot.
+	local mem_kb
+	mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+	if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 4000000 ]; then
+		say "warning: GitLab wants ~4 GB of RAM and this host has $((mem_kb / 1024)) MB. Expect it to be slow or to be killed."
+	fi
+}
+
+root_password() {
+	# Omnibus writes the initial password here and deletes it after 24 hours.
+	docker exec nsx-gitlab cat /etc/gitlab/initial_root_password 2>/dev/null |
+		sed -n 's/^Password: //p' | head -1
+}
+
+wait_for_gitlab() {
+	local deadline=$((SECONDS + WAIT_MINUTES * 60)) last=""
+	say "waiting for GitLab to answer at $GITLAB_URL (first boot runs database migrations; up to $WAIT_MINUTES minutes)"
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		local health
+		health="$(docker inspect --format '{{.State.Health.Status}}' nsx-gitlab 2>/dev/null || echo unknown)"
+		if [ "$health" != "$last" ]; then
+			say "  container health: $health"
+			last="$health"
+		fi
+		if curl -sf -o /dev/null --max-time 10 "$GITLAB_URL/-/readiness?all=1" 2>/dev/null ||
+			curl -sf -o /dev/null --max-time 10 "$GITLAB_URL/users/sign_in" 2>/dev/null; then
+			say "GitLab is up."
+			return 0
+		fi
+		sleep 15
+	done
+	die "GitLab did not become ready within $WAIT_MINUTES minutes.
+       Look at:  cd deploy/gitlab && docker compose logs --tail=100 gitlab
+       Then re-run this script; it picks up where it left off."
+}
+
+api() {
+	local method="$1" path="$2"
+	shift 2
+	curl -sS --fail-with-body --max-time 60 \
+		--header "PRIVATE-TOKEN: $ROOT_TOKEN" \
+		--request "$method" "$GITLAB_URL/api/v4$path" "$@"
+}
+
+make_root_token() {
+	# A token minted through the Rails console, because there is no API to
+	# create the first token without one.
+	say "minting an API token for root..."
+	ROOT_TOKEN="$(
+		docker exec nsx-gitlab gitlab-rails runner "
+          u = User.find_by_username('root')
+          t = u.personal_access_tokens.create!(
+                scopes: ['api','write_repository'],
+                name: 'nsx-bootstrap',
+                expires_at: 90.days.from_now)
+          t.set_token('${TOKEN_SEED}')
+          t.save!
+          puts '${TOKEN_SEED}'
+        " 2>/dev/null | tr -d '\r' | tail -1
+	)"
+	[ -n "$ROOT_TOKEN" ] || die "could not create an API token. Is GitLab fully started? Try: scripts/gitlab-up.sh --status"
+}
+
+create_project() {
+	local existing
+	existing="$(api GET "/projects/root%2F$PROJECT_NAME" 2>/dev/null || true)"
+	if printf '%s' "$existing" | grep -q '"id"'; then
+		say "project root/$PROJECT_NAME already exists; leaving it alone."
+		return 0
+	fi
+	say "creating project root/$PROJECT_NAME..."
+	api POST "/projects" \
+		--data-urlencode "name=$PROJECT_NAME" \
+		--data-urlencode "path=$PROJECT_NAME" \
+		--data "visibility=private" \
+		--data "initialize_with_readme=false" >/dev/null
+}
+
+push_repository() {
+	local remote="http://root:${ROOT_TOKEN}@${GITLAB_HOST}:${GITLAB_PORT}/root/${PROJECT_NAME}.git"
+	git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || {
+		say "initialising a git repository in $REPO_ROOT"
+		git -C "$REPO_ROOT" init -q
+	}
+	if [ -z "$(git -C "$REPO_ROOT" status --porcelain=v1 2>/dev/null)" ] &&
+		git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+		: # already committed
+	else
+		git -C "$REPO_ROOT" add -A
+		git -C "$REPO_ROOT" -c user.name="${GIT_AUTHOR_NAME:-nsx-terraform}" \
+			-c user.email="${GIT_AUTHOR_EMAIL:-nsx-terraform@localhost}" \
+			commit -q -m "Initial NSX Terraform scaffold" || true
+	fi
+
+	# The URL carries a token, so it is set transiently and never stored.
+	say "pushing to root/$PROJECT_NAME..."
+	git -C "$REPO_ROOT" push -q "$remote" "HEAD:refs/heads/main" ||
+		die "push failed. Check that GitLab is reachable at $GITLAB_URL"
+
+	git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1 ||
+		git -C "$REPO_ROOT" remote add origin "http://${GITLAB_HOST}:${GITLAB_PORT}/root/${PROJECT_NAME}.git"
+	say "remote 'origin' points at http://${GITLAB_HOST}:${GITLAB_PORT}/root/${PROJECT_NAME}.git"
+	say "(the push used a token in the URL; it was not written to .git/config)"
+}
+
+register_runner() {
+	local token
+	token="$(api POST "/user/runners" \
+		--data "runner_type=project_type" \
+		--data-urlencode "description=nsx-local" \
+		--data "run_untagged=true" \
+		--data-urlencode "project_id=$(api GET "/projects/root%2F$PROJECT_NAME" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)" 2>/dev/null |
+		sed -n 's/.*"token":"\([^"]*\)".*/\1/p' | head -1)"
+	if [ -z "$token" ]; then
+		say "note: could not mint a runner token automatically."
+		say "      Register one by hand: Settings -> CI/CD -> Runners in the project."
+		return 0
+	fi
+	docker exec nsx-gitlab-runner gitlab-runner register \
+		--non-interactive \
+		--url "http://${GITLAB_HOST}:${GITLAB_PORT}/" \
+		--token "$token" \
+		--executor docker \
+		--docker-image "hashicorp/terraform:1.9.8" \
+		--docker-network-mode host >/dev/null 2>&1 &&
+		say "runner registered." ||
+		say "note: runner registration failed; register one from the project's CI/CD settings."
+}
+
+summary() {
+	local pw
+	pw="$(root_password || true)"
+	cat <<SUMMARY
+
+===================================================================
+ GitLab is ready
+===================================================================
+
+  URL       $GITLAB_URL
+  Project   $GITLAB_URL/root/$PROJECT_NAME
+  Username  root
+  Password  ${pw:-(expired — Omnibus deletes it 24h after first boot;
+            reset with: docker exec -it nsx-gitlab gitlab-rake "gitlab:password:reset[root]")}
+
+Change that password at first login.
+
+Next, so the pipeline can reach your NSX managers — Settings -> CI/CD ->
+Variables in the project:
+
+  VAULT_ADDR          your Vault endpoint            masked
+  VAULT_PLAN_TOKEN    a READ-ONLY token              masked
+  VAULT_APPLY_TOKEN   a write token                  masked, PROTECTED
+  CI_API_TOKEN        project token, 'api' scope     masked
+
+Then protect the default branch (Settings -> Repository -> Protected branches)
+so only the pipeline can apply. docs/GITOPS.md explains the whole flow.
+
+SUMMARY
+}
+
+main() {
+	case "${1:-}" in
+	--status)
+		preflight
+		compose ps
+		say ""
+		say "URL: $GITLAB_URL"
+		curl -sf -o /dev/null --max-time 10 "$GITLAB_URL/users/sign_in" &&
+			say "state: answering" || say "state: not answering yet"
+		exit 0
+		;;
+	--password)
+		root_password || die "no initial password file; it expires 24h after first boot.
+       Reset with: docker exec -it nsx-gitlab gitlab-rake \"gitlab:password:reset[root]\""
+		exit 0
+		;;
+	--down)
+		preflight
+		compose down
+		say "stopped. Data kept — 'scripts/gitlab-up.sh' brings it back."
+		exit 0
+		;;
+	--destroy)
+		preflight
+		printf 'This deletes the GitLab volumes and everything in them.\nType "destroy gitlab" to continue: ' >&2
+		local reply=""
+		IFS= read -r reply </dev/tty || reply=""
+		[ "$reply" = "destroy gitlab" ] || die "not confirmed; nothing was removed."
+		compose down -v
+		say "removed."
+		exit 0
+		;;
+	"") ;;
+	*) die "unknown option: ${1}. Try --status, --password, --down or --destroy." ;;
+	esac
+
+	preflight
+	say "starting GitLab and a runner (deploy/gitlab/docker-compose.yml)..."
+	compose up -d
+	wait_for_gitlab
+
+	TOKEN_SEED="nsxbootstrap$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+	make_root_token
+	create_project
+	push_repository
+	register_runner
+	summary
+}
+
+main "$@"
+SCAFFOLD_EOF
+mark_executable scripts/gitlab-up.sh
+
+write_file scripts/enable-gitops.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Put an existing tree under version control and turn on the review pipeline.
+#
+#   scripts/enable-gitops.sh                          # ask
+#   scripts/enable-gitops.sh --remote URL             # use an existing repo
+#   scripts/enable-gitops.sh --local-gitlab           # stand one up in Docker
+#
+# This is the migration path for a tree that was set up without versioning.
+# Nothing about the Terraform changes — the pipeline files are already here,
+# because bootstrap.sh always writes them. What is missing is a remote and a
+# first commit, and that is all this does.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE=""
+LOCAL_GITLAB=0
+BRANCH="${GIT_BRANCH:-main}"
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--remote)
+		REMOTE="${2:?--remote needs a URL}"
+		shift 2
+		;;
+	--remote=*)
+		REMOTE="${1#*=}"
+		shift
+		;;
+	--local-gitlab)
+		LOCAL_GITLAB=1
+		shift
+		;;
+	--branch)
+		BRANCH="${2:?--branch needs a name}"
+		shift 2
+		;;
+	-h | --help)
+		sed -n '2,14p' "$0"
+		exit 0
+		;;
+	*) die "unknown option: $1" ;;
+	esac
+done
+
+if [ "$LOCAL_GITLAB" = 1 ]; then
+	exec "$REPO_ROOT/scripts/gitlab-up.sh"
+fi
+
+if [ -z "$REMOTE" ]; then
+	if [ ! -r /dev/tty ]; then
+		die "no --remote given and no terminal to ask on."
+	fi
+	say ""
+	say "Where should these files live?"
+	say ""
+	say "  1) An existing git repository — I have the URL"
+	say "  2) Stand up GitLab locally in Docker and create the repository"
+	say "  3) Cancel"
+	say ""
+	printf 'Select [1]: '
+	IFS= read -r choice </dev/tty || choice=""
+	case "${choice:-1}" in
+	1)
+		printf 'Remote URL (git@host:group/repo.git or https://...): '
+		IFS= read -r REMOTE </dev/tty || REMOTE=""
+		[ -n "$REMOTE" ] || die "no URL given."
+		;;
+	2) exec "$REPO_ROOT/scripts/gitlab-up.sh" ;;
+	*) die "cancelled." ;;
+	esac
+fi
+
+# --- git init, commit, remote ----------------------------------------------
+
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+	say "initialising a git repository in $REPO_ROOT"
+	git -C "$REPO_ROOT" init -q -b "$BRANCH"
+fi
+
+# .gitignore already excludes state, plans and reports. Verify rather than
+# assume: committing a state file is the one mistake with no clean undo.
+[ -f "$REPO_ROOT/.gitignore" ] || die ".gitignore is missing. Re-run scripts/bootstrap.sh before committing anything."
+# -x, not a prefix match: '*.tfstate.*' starts with the same characters and
+# would let a bare terraform.tfstate through.
+grep -qx '\*\.tfstate' "$REPO_ROOT/.gitignore" || die ".gitignore does not exclude *.tfstate. Refusing to commit."
+
+staged_state="$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all |
+	awk '{print $2}' | grep -E '\.tfstate|/tfplan$|\.tfplan$' || true)"
+if [ -n "$staged_state" ]; then
+	die "these look like state or plan files and must never be committed:
+$staged_state
+       Remove them, or add them to .gitignore, then re-run."
+fi
+
+if ! git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+	git -C "$REPO_ROOT" add -A
+	git -C "$REPO_ROOT" commit -q -m "Initial NSX Terraform scaffold"
+	say "committed the tree."
+fi
+
+if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+	current="$(git -C "$REPO_ROOT" remote get-url origin)"
+	if [ "$current" != "$REMOTE" ]; then
+		say "note: 'origin' already points at $current — leaving it alone."
+		say "      To change it: git remote set-url origin '$REMOTE'"
+	fi
+else
+	git -C "$REPO_ROOT" remote add origin "$REMOTE"
+	say "remote 'origin' set to $REMOTE"
+fi
+
+cat <<NEXT
+
+Version control is on. What is left is on the git host, not here:
+
+  1. Push:            git push -u origin $BRANCH
+  2. Protect '$BRANCH' so nobody can push to it directly.
+  3. Require an approval on merge requests / pull requests.
+  4. Set the CI variables so the pipeline can plan:
+       VAULT_ADDR, VAULT_PLAN_TOKEN (read-only),
+       VAULT_APPLY_TOKEN (write, PROTECTED), CI_API_TOKEN
+  5. Open a merge request with a small rule change and confirm the plan
+     appears on it before trusting the pipeline with anything real.
+
+docs/GITOPS.md is the whole flow, including who approves what.
+NEXT
+SCAFFOLD_EOF
+mark_executable scripts/enable-gitops.sh
+
+write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
+# A rule change is a merge request, and the plan is the review artifact.
+#
+#   edit data/policies/*.yaml  ->  push  ->  MR
+#     validate   schemas and conventions, offline, no credentials
+#     plan       one job per manager, read-only credentials, posted to the MR
+#     review     an approver reads the plan and approves the MR
+#     merge      to the default branch
+#     apply      MANUAL job, protected environment, applies the SAVED plan
+#
+# The apply never re-plans. It applies the artifact the approver looked at, so
+# what was reviewed is what reaches the firewall.
+#
+# The per-manager jobs are generated from inventory/managers.yaml by a child
+# pipeline, so adding an eleventh Local Manager stays a data change.
+#
+# Required CI/CD variables (Settings -> CI/CD -> Variables), all masked:
+#   VAULT_ADDR          Vault endpoint
+#   VAULT_PLAN_TOKEN    READ-ONLY. Available to every branch.
+#   VAULT_APPLY_TOKEN   write. PROTECTED — protected branches and tags only.
+# See docs/GITOPS.md.
+
+stages:
+  - validate
+  - generate
+  - plan
+  - apply
+
+default:
+  image: hashicorp/terraform:1.9.8
+  before_script:
+    - apk add --no-cache python3 curl git bash >/dev/null
+  interruptible: true
+
+variables:
+  GIT_DEPTH: "20"
+
+# --- validate: offline, no credentials, runs on everything ------------------
+
+data:
+  stage: validate
+  script:
+    - python3 scripts/validate-data.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+terraform:
+  stage: validate
+  script:
+    - terraform fmt -recursive -check -diff .
+    - |
+      set -eu
+      for stack in stacks/*/; do
+        echo "--- ${stack}"
+        terraform -chdir="${stack}" init -backend=false -input=false
+        terraform -chdir="${stack}" validate
+      done
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# --- generate: turn the inventory into per-manager jobs ---------------------
+
+matrix:
+  stage: generate
+  script:
+    - python3 scripts/gitlab-child-pipeline.py > generated-pipeline.yml
+    - cat generated-pipeline.yml
+  artifacts:
+    paths: [generated-pipeline.yml]
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# --- plan and apply: one job per manager, from the generated pipeline -------
+
+managers:
+  stage: plan
+  needs: [matrix]
+  trigger:
+    include:
+      - artifact: generated-pipeline.yml
+        job: matrix
+    strategy: depend
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+SCAFFOLD_EOF
+
+write_file scripts/gitlab-child-pipeline.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Emit the per-manager half of the GitLab pipeline, from the inventory.
+
+GitLab cannot build a job matrix out of a file at parse time, so the parent
+pipeline runs this and triggers the result as a child pipeline. That is what
+keeps "adding an eleventh Local Manager is a data change" true in CI as well as
+in Terraform.
+
+  scripts/gitlab-child-pipeline.py > generated-pipeline.yml
+
+On a merge request it emits plan jobs only. On the default branch it emits plan
+jobs plus a MANUAL apply job per manager, each applying the plan artifact its
+own plan job produced — never a fresh one.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ci_matrix_lib import entries  # noqa: E402
+
+DEFAULT_BRANCH = os.environ.get("CI_DEFAULT_BRANCH", "main")
+IS_DEFAULT_BRANCH = os.environ.get("CI_COMMIT_BRANCH") == DEFAULT_BRANCH
+
+
+def job_name(prefix: str, row: dict) -> str:
+    return f"{prefix} {row['stack']} @ {row['site']}"
+
+
+def main() -> int:
+    rows = entries(None)
+    if not rows:
+        # An empty inventory must not fail the pipeline: a fresh repository has
+        # no managers yet, and there is nothing to plan.
+        print("no-managers:")
+        print("  stage: plan")
+        print("  script:")
+        print('    - echo "inventory/managers.yaml lists no enabled managers; nothing to plan."')
+        return 0
+
+    out: list[str] = []
+    out.append("stages: [plan, apply]")
+    out.append("")
+    out.append("default:")
+    out.append("  image: hashicorp/terraform:1.9.8")
+    out.append("  before_script:")
+    out.append("    - apk add --no-cache python3 curl git bash jq >/dev/null")
+    out.append("")
+
+    for row in rows:
+        plan = job_name("plan", row)
+        out.append(f'"{plan}":')
+        out.append("  stage: plan")
+        out.append("  variables:")
+        out.append(f'    SITE: "{row["site"]}"')
+        out.append(f'    STACK: "{row["stack"]}"')
+        out.append("    VAULT_TOKEN: $VAULT_PLAN_TOKEN")
+        out.append("  script:")
+        out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh plan "$STACK" "$SITE"')
+        out.append('    - scripts/tf.sh show "$STACK" "$SITE" | tee "plan-$STACK-$SITE.txt"')
+        out.append("    - scripts/post-plan-comment.sh \"$STACK\" \"$SITE\" \"plan-$STACK-$SITE.txt\"")
+        out.append("  artifacts:")
+        out.append("    name: \"plan-$STACK-$SITE\"")
+        out.append("    paths:")
+        out.append(f'      - stacks/{row["stack"]}/tfplan')
+        out.append('      - "plan-$STACK-$SITE.txt"')
+        out.append("    expire_in: 1 week")
+        out.append("    when: always")
+        # A failed plan at one site must not hide the others.
+        out.append("  allow_failure: false")
+        out.append("")
+
+        if not IS_DEFAULT_BRANCH:
+            continue
+
+        apply_job = job_name("apply", row)
+        out.append(f'"{apply_job}":')
+        out.append("  stage: apply")
+        out.append("  needs:")
+        out.append(f'    - job: "{plan}"')
+        out.append("      artifacts: true")
+        # The gate. GitLab will not start this without a human, and a protected
+        # environment restricts who that human can be.
+        out.append("  when: manual")
+        out.append("  allow_failure: false")
+        out.append("  environment:")
+        out.append(f'    name: nsx/{row["site"]}/{row["stack"]}')
+        out.append("  variables:")
+        out.append(f'    SITE: "{row["site"]}"')
+        out.append(f'    STACK: "{row["stack"]}"')
+        out.append("    VAULT_TOKEN: $VAULT_APPLY_TOKEN")
+        out.append("    APPROVE: \"yes\"")
+        out.append("  script:")
+        # tf.sh refuses without a saved plan, so this cannot silently re-plan.
+        out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan artifact; re-run the plan job" >&2; exit 1; }')
+        out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
+        out.append("")
+
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/gitlab-child-pipeline.py
+
+write_file scripts/post-plan-comment.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Post a rendered plan summary to the merge request, so the approver reads the
+# plan in the review rather than digging through job logs.
+#
+#   scripts/post-plan-comment.sh <stack> <site> <rendered-plan-file>
+#
+# Never posts the plan FILE — that is a sensitive artifact. It posts the
+# rendered text, truncated, which is what a human needs to make the decision.
+#
+# Silently does nothing outside a merge request pipeline, or when
+# CI_API_TOKEN is not set, so it is safe to call unconditionally.
+
+set -euo pipefail
+
+stack="${1:?stack}"
+site="${2:?site}"
+plan_file="${3:?rendered plan file}"
+
+[ -n "${CI_MERGE_REQUEST_IID:-}" ] || {
+	echo "not a merge request pipeline; skipping the plan comment."
+	exit 0
+}
+[ -n "${CI_API_TOKEN:-}" ] || {
+	echo "CI_API_TOKEN is not set; skipping the plan comment. Set it to post plans to the MR."
+	exit 0
+}
+
+api="${CI_API_V4_URL:?}/projects/${CI_PROJECT_ID:?}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
+
+# GitLab rejects very large notes, and nobody reads 4000 lines of plan anyway.
+max_lines=300
+total="$(wc -l <"$plan_file" | tr -d ' ')"
+body_file="$(mktemp)"
+trap 'rm -f "$body_file"' EXIT
+
+{
+	printf '### Terraform plan — `%s` @ `%s`\n\n' "$stack" "$site"
+	if grep -qE '^(Plan:|No changes)' "$plan_file"; then
+		printf '%s\n\n' "$(grep -E '^(Plan:|No changes)' "$plan_file" | head -1)"
+	fi
+	printf '<details><summary>plan output (%s lines)</summary>\n\n```\n' "$total"
+	head -n "$max_lines" "$plan_file"
+	if [ "$total" -gt "$max_lines" ]; then
+		printf '\n... truncated at %s lines. Full output in job %s.\n' "$max_lines" "${CI_JOB_URL:-}"
+	fi
+	printf '```\n\n</details>\n\n'
+	printf -- '- [ ] resource count delta matches the intent\n'
+	printf -- '- [ ] no unexpected destroys\n'
+	printf -- '- [ ] no change to the default rule or the Emergency category\n'
+	printf -- '- [ ] every new or changed rule has a non-empty scope\n'
+} >"$body_file"
+
+curl --silent --show-error --fail-with-body \
+	--header "PRIVATE-TOKEN: ${CI_API_TOKEN}" \
+	--header "Content-Type: application/x-www-form-urlencoded" \
+	--data-urlencode "body@$body_file" \
+	--request POST "$api" >/dev/null
+
+echo "posted the plan for $stack @ $site to merge request !${CI_MERGE_REQUEST_IID}"
+SCAFFOLD_EOF
+mark_executable scripts/post-plan-comment.sh
+
 write_file .github/workflows/validate.yml <<'SCAFFOLD_EOF'
 # Runs on every pull request. No credentials, no network access to any manager:
 # everything here is offline validation of the data and the HCL.
@@ -7164,15 +8248,64 @@ if [ "$DRY_RUN" != 1 ]; then
 	done
 fi
 
-if [ "$WITH_GIT" = 1 ] && [ "$DRY_RUN" != 1 ]; then
+if { [ "$WITH_GIT" = 1 ] || [ "$VCS" = git ] || [ "$VCS" = gitlab-docker ]; } && [ "$DRY_RUN" != 1 ]; then
 	if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
 		log ""
 		log "git: already a working tree, left alone"
 	else
 		log ""
-		git -C "$ROOT" init -q
+		git -C "$ROOT" init -q -b "$GIT_BRANCH" 2>/dev/null ||
+			git -C "$ROOT" init -q # -b needs git 2.28+; older git gets its default
 		log "git: initialised a repository in $ROOT"
 	fi
+fi
+
+# --- what the version-control choice actually does -------------------------
+#
+# Deliberately after every file is written, and never in a dry run. Generation
+# is identical whatever is chosen here — .gitlab-ci.yml, the GitHub workflows
+# and the helper scripts are always present — so this only wires up a remote or
+# starts a container. That is what makes "decide later" free.
+
+if [ "$DRY_RUN" != 1 ]; then
+	case "$VCS" in
+	git)
+		if [ -n "$GIT_REMOTE" ]; then
+			if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+				log "git: 'origin' already set to $(git -C "$ROOT" remote get-url origin), left alone"
+			else
+				git -C "$ROOT" remote add origin "$GIT_REMOTE" &&
+					log "git: remote 'origin' set to $GIT_REMOTE"
+			fi
+			log ""
+			log "next, to turn on the review pipeline:"
+			log "  git add -A && git commit -m 'Initial NSX Terraform scaffold'"
+			log "  git push -u origin $GIT_BRANCH"
+			log "  then protect '$GIT_BRANCH', require an approval, and set the CI"
+			log "  variables listed in docs/GITOPS.md."
+		fi
+		;;
+	gitlab-docker)
+		log ""
+		log "starting GitLab in Docker..."
+		if [ -x "$ROOT/scripts/gitlab-up.sh" ]; then
+			# Not fatal: the files are written and correct either way, and the
+			# script is re-runnable.
+			"$ROOT/scripts/gitlab-up.sh" || {
+				warn "GitLab did not come up. The repository is complete and unaffected.
+         Re-run when Docker is ready:  scripts/gitlab-up.sh"
+			}
+		else
+			warn "scripts/gitlab-up.sh is missing or not executable."
+		fi
+		;;
+	none)
+		log ""
+		log "no version control configured. Nothing records who changed a firewall"
+		log "rule or why, and there is no plan for anyone to approve."
+		log "When you want that:  scripts/enable-gitops.sh"
+		;;
+	esac
 fi
 
 log ""

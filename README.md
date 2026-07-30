@@ -14,15 +14,17 @@ example data — into whatever directory you point it at.
 ```
 
 ```
- 1) Basic deployment      — best practices assumed, three questions
+ 1) Basic deployment      — best practices assumed, four questions
  2) Advanced deployment   — every option asked
  3) Update an existing tree
- 4) Dry run               — show what a basic run would write
+ 4) Add version control and the review pipeline to an existing tree
+ 5) Dry run               — show what a basic run would write
 ```
 
-**Basic** asks where to put it, which state backend, and whether to include the
-worked example — everything else takes the recommended answer. **Advanced** asks
-about every flag. Either way it prints the equivalent command line before it
+**Basic** asks where to put it, **where the files live and how changes get
+reviewed**, which state backend, and whether to include the worked example —
+everything else takes the recommended answer. **Advanced** asks about every
+flag. Either way it prints the equivalent command line before it
 writes anything, so one pass teaches you the scripted form:
 
 ```bash
@@ -89,6 +91,42 @@ tree it creates, so that tree can regenerate and update itself.
 
 It is also idempotent and non-destructive — see below.
 
+## A rule change is a merge request
+
+Nobody edits the firewall. They edit a file, and a pipeline turns that into a
+plan somebody approves:
+
+```
+edit data/policies/payments.yaml
+  -> push, open a merge request
+  -> VALIDATE  schemas and conventions, offline, no credentials
+  -> PLAN      one job per manager, READ-ONLY credentials,
+               rendered plan posted onto the merge request
+  -> APPROVER  reads the plan, approves
+  -> MERGE     to the default branch
+  -> APPLY     MANUAL job, protected environment, applies the SAVED plan
+```
+
+**The apply never re-plans.** It applies the artifact the approver looked at, so
+what was reviewed is what reaches the firewall.
+
+Both `.gitlab-ci.yml` and `.github/workflows/` are generated every time, so this
+is available whatever you chose at setup. Three ways to turn it on:
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab   # no GitLab? stand one up in Docker
+scripts/bootstrap.sh                      # or answer the question at first run
+```
+
+`--local-gitlab` runs GitLab CE and a runner in Docker, creates the project,
+pushes, registers the runner, and prints the initial root password. A lab
+instance, not a production one.
+
+The per-manager jobs come from `inventory/managers.yaml`, so adding an eleventh
+Local Manager stays a data change. GitLab and GitHub read the same
+`scripts/ci_matrix_lib.py` and cannot drift apart.
+
 ## Why the state is split five ways
 
 By **change cadence and blast radius**, not topology — a daily rule edit must
@@ -154,6 +192,8 @@ creates, because they describe that tree.
 | `docs/STRUCTURE.md` | What each directory is for, and what must *not* go in it. |
 | `docs/TAGGING.md` | Who applies tags — the two variants, the ownership constraint, and how the boundary is enforced. |
 | `docs/IMPORT.md` | Adopting an estate that already exists: the tranche workflow. |
+| `docs/GITOPS.md` | The review flow end to end, the CI variables, the branch protection it depends on, and what the approver is checking. |
+| `deploy/gitlab/README.md` | Running a local GitLab in Docker. |
 | `modules/*/README.md` | Input shape and gotchas, one per module. |
 | `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
 | `inventory/README.md` | How the manager registry drives everything else. |
@@ -169,6 +209,7 @@ creates, because they describe that tree.
 | Add a firewall rule | `docs/ARCHITECTURE.md` §8, §10 |
 | Decide who tags workloads | `docs/TAGGING.md` |
 | Choose a state backend | `docs/SETUP.md` §2.1 |
+| Get changes reviewed before they apply | `docs/SETUP.md` §2.2, then `docs/GITOPS.md` |
 | Adopt an existing estate | `docs/IMPORT.md` |
 | Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
 | Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
