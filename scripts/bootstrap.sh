@@ -48,6 +48,9 @@ GIT_BRANCH=main
 # the only one this script can set up end to end — repository, runner, variables
 # and gate — rather than leaving files for somebody to wire up.
 CI_PLATFORM=gitlab   # gitlab | github | both | none
+GITLAB_URL_ARG=""
+GITLAB_TOKEN_ARG="${GITLAB_TOKEN:-}"
+GITLAB_PROJECT_ARG=""
 CI_EXPLICIT=0        # set when --ci was given, so a VCS choice does not override it
 
 created=0
@@ -93,6 +96,16 @@ Options:
                       writes whatever pipeline is missing.
       --ci PLATFORM   Which pipeline definitions to write: gitlab, github, both
                       or none. Follows --vcs unless given explicitly.
+      --gitlab-url URL
+      --gitlab-project GROUP/NAME
+      --gitlab-token TOKEN
+                      Give all three and the run creates the project on that
+                      GitLab, pushes, sets the CI/CD variables, protects the
+                      default branch and creates the apply environments. Without
+                      them the pipeline is still written and the remote still
+                      attached — nothing is created. The token needs the 'api'
+                      scope; it is used in memory and never written to disk.
+                      Also read from GITLAB_TOKEN.
       --git-remote URL
                       Remote to attach as 'origin'.
       --git-branch NAME
@@ -274,12 +287,26 @@ wizard_vcs() {
 		case "$how" in
 		1)
 			VCS=gitlab
-			GIT_REMOTE="$(ask "  Repository URL (git@gitlab.example.com:group/repo.git)" "")"
-			[ -n "$GIT_REMOTE" ] || {
-				say "  no URL given; writing the pipeline and leaving the remote for later."
+			GITLAB_URL_ARG="$(ask "  GitLab URL (https://gitlab.example.com)" "$GITLAB_URL_ARG")"
+			if [ -n "$GITLAB_URL_ARG" ]; then
+				GITLAB_PROJECT_ARG="$(ask "  Project path (group/name)" "${GITLAB_PROJECT_ARG:-netops/nsx-terraform}")"
+				say ""
+				say "  With an access token (scope 'api', Maintainer or Owner) this can"
+				say "  create the project, push, set the CI variables and protect the"
+				say "  default branch. Leave blank to do that yourself later."
+				GITLAB_TOKEN_ARG="$(ask "  Access token (blank to skip)" "")"
+				GIT_BRANCH="$(ask "  Default branch" "$GIT_BRANCH")"
+				GIT_REMOTE="${GITLAB_URL_ARG%/}/${GITLAB_PROJECT_ARG}.git"
+				if [ -z "$GITLAB_TOKEN_ARG" ]; then
+					say ""
+					say "  No token: the remote will be set but nothing created or pushed."
+					say "  Later:  scripts/gitlab-setup.sh --url $GITLAB_URL_ARG \\"
+					say "            --token TOKEN --project $GITLAB_PROJECT_ARG"
+				fi
+			else
+				say "  no URL given; writing the pipeline and leaving GitLab for later."
 				VCS=none
-			}
-			[ "$VCS" = gitlab ] && GIT_BRANCH="$(ask "  Default branch" "$GIT_BRANCH")"
+			fi
 			;;
 		2)
 			VCS=gitlab-docker
@@ -369,7 +396,15 @@ wizard_summary_and_go() {
 	local cmd="scripts/bootstrap.sh --dir '$ROOT'"
 	[ "$BACKEND" != local ] && cmd="$cmd --backend $BACKEND"
 	case "$VCS" in
-	gitlab | github | git) cmd="$cmd --vcs $VCS --git-remote '$GIT_REMOTE'" ;;
+	gitlab)
+		cmd="$cmd --vcs gitlab"
+		if [ -n "$GITLAB_TOKEN_ARG" ]; then
+			cmd="$cmd --gitlab-url '$GITLAB_URL_ARG' --gitlab-project '$GITLAB_PROJECT_ARG' --gitlab-token '***'"
+		else
+			cmd="$cmd --git-remote '$GIT_REMOTE'"
+		fi
+		;;
+	github | git) cmd="$cmd --vcs $VCS --git-remote '$GIT_REMOTE'" ;;
 	gitlab-docker) cmd="$cmd --vcs gitlab-docker" ;;
 	none) cmd="$cmd --vcs none" ;;
 	esac
@@ -384,7 +419,14 @@ wizard_summary_and_go() {
 	say "-------------------------------------------------------------------"
 	local vcs_label
 	case "$VCS" in
-	gitlab | github | git) vcs_label="$VCS — ${GIT_REMOTE:-no remote yet} (branch $GIT_BRANCH)" ;;
+	gitlab)
+		if [ -n "$GITLAB_TOKEN_ARG" ]; then
+			vcs_label="GitLab $GITLAB_URL_ARG — project $GITLAB_PROJECT_ARG will be created and pushed"
+		else
+			vcs_label="GitLab — ${GIT_REMOTE:-no remote yet} (remote only; nothing created)"
+		fi
+		;;
+	github | git) vcs_label="$VCS — ${GIT_REMOTE:-no remote yet} (branch $GIT_BRANCH)" ;;
 	gitlab-docker) vcs_label="GitLab in Docker, started after generation" ;;
 	none) vcs_label="local files only — no remote (migrate later)" ;;
 	*) vcs_label="unchanged" ;;
@@ -643,6 +685,35 @@ while [ $# -gt 0 ]; do
 	--git-remote=*)
 		GIT_REMOTE="${1#*=}"
 		[ "$VCS" = ask ] && VCS=gitlab
+		shift
+		;;
+	--gitlab-url)
+		[ $# -ge 2 ] || die "--gitlab-url requires a URL"
+		GITLAB_URL_ARG="$2"
+		[ "$VCS" = ask ] && VCS=gitlab
+		shift 2
+		;;
+	--gitlab-url=*)
+		GITLAB_URL_ARG="${1#*=}"
+		[ "$VCS" = ask ] && VCS=gitlab
+		shift
+		;;
+	--gitlab-token)
+		[ $# -ge 2 ] || die "--gitlab-token requires a token"
+		GITLAB_TOKEN_ARG="$2"
+		shift 2
+		;;
+	--gitlab-token=*)
+		GITLAB_TOKEN_ARG="${1#*=}"
+		shift
+		;;
+	--gitlab-project)
+		[ $# -ge 2 ] || die "--gitlab-project requires group/name"
+		GITLAB_PROJECT_ARG="$2"
+		shift 2
+		;;
+	--gitlab-project=*)
+		GITLAB_PROJECT_ARG="${1#*=}"
 		shift
 		;;
 	--git-branch)
@@ -1604,6 +1675,36 @@ correct and complete, but the secrets and the environment protection are yours
 to set, and nothing here can do it for you.
 
 ## Setting it up
+
+**Writing the pipeline is not the same as having one.** The files are inert
+until a GitLab project exists, the CI variables are set and the branch is
+protected. `scripts/gitlab-setup.sh` does that part against any GitLab:
+
+```bash
+VAULT_ADDR=https://vault.example.com \
+VAULT_PLAN_TOKEN=... VAULT_APPLY_TOKEN=... \
+scripts/gitlab-setup.sh --url https://gitlab.example.com \
+                        --token glpat-xxxx \
+                        --project netops/nsx-terraform
+```
+
+It creates the project (and the group if needed), pushes, sets the four CI
+variables with `VAULT_APPLY_TOKEN` marked **protected**, protects the default
+branch against direct pushes, and creates one environment per manager/stack. Each
+step is skipped if already done, so it is safe to re-run.
+
+`scripts/gitlab-up.sh` calls the same script after starting its container, so
+the Docker path and the bring-your-own-GitLab path configure a project
+identically.
+
+Two things it deliberately leaves alone:
+
+- **Merge request approval rules.** Set at least one approver under
+  Settings → Merge requests → Approvals.
+- **Protected environments**, which are GitLab Premium. On Free the gate is the
+  manual apply job plus the protected branch and protected token — weaker,
+  because anyone who can run a pipeline on the default branch can start the
+  apply. The script says so rather than implying the gate is stronger than it is.
 
 Three ways in, all producing the same pipeline:
 
@@ -7040,6 +7141,284 @@ Set these in the project, under Settings → CI/CD → Variables:
 branches. That is what stops a feature branch from applying anything.
 SCAFFOLD_EOF
 
+write_file scripts/gitlab-setup.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Make a GitLab project ready to run this repository's review pipeline.
+#
+#   scripts/gitlab-setup.sh --url https://gitlab.example.com \
+#                           --token glpat-xxxx \
+#                           --project netops/nsx-terraform
+#
+# Works against any GitLab — your own, or the one scripts/gitlab-up.sh starts in
+# Docker, which calls this script rather than duplicating it.
+#
+# What it does, each step skipped if already done:
+#   1. create the project (and the group, if it does not exist)
+#   2. push this repository to it
+#   3. set the CI/CD variables the pipeline needs
+#   4. protect the default branch so nobody can push straight to it
+#   5. create one environment per manager/stack for the apply jobs
+#
+# The token needs the 'api' scope and Maintainer or Owner on the group. It is
+# read from --token or GITLAB_TOKEN, used in memory, and never written to disk
+# or into .git/config.
+#
+# Credentials for the pipeline are passed as environment variables, so they do
+# not appear in your shell history:
+#
+#   VAULT_ADDR=... VAULT_PLAN_TOKEN=... VAULT_APPLY_TOKEN=... \
+#     scripts/gitlab-setup.sh --url ... --token ... --project ...
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+URL="${GITLAB_URL:-}"
+TOKEN="${GITLAB_TOKEN:-}"
+PROJECT="${GITLAB_PROJECT:-}"
+BRANCH="${GIT_BRANCH:-main}"
+DRY=0
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--url) URL="${2:?--url needs a GitLab base URL}"; shift 2 ;;
+	--url=*) URL="${1#*=}"; shift ;;
+	--token) TOKEN="${2:?--token needs a personal or group access token}"; shift 2 ;;
+	--token=*) TOKEN="${1#*=}"; shift ;;
+	--project) PROJECT="${2:?--project needs group/name}"; shift 2 ;;
+	--project=*) PROJECT="${1#*=}"; shift ;;
+	--branch) BRANCH="${2:?--branch needs a name}"; shift 2 ;;
+	--branch=*) BRANCH="${1#*=}"; shift ;;
+	--dry-run) DRY=1; shift ;;
+	-h | --help) sed -n '2,30p' "$0"; exit 0 ;;
+	*) die "unknown option: $1" ;;
+	esac
+done
+
+[ -n "$URL" ] || die "--url is required (for example https://gitlab.example.com)"
+[ -n "$TOKEN" ] || die "--token is required, or set GITLAB_TOKEN. It needs the 'api' scope."
+[ -n "$PROJECT" ] || die "--project is required, as group/name"
+
+URL="${URL%/}"
+API="$URL/api/v4"
+GROUP="${PROJECT%/*}"
+NAME="${PROJECT##*/}"
+[ "$GROUP" = "$PROJECT" ] && GROUP=""
+
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required (for URL encoding and JSON)"
+
+urlenc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+jget() { python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for k in sys.argv[1:]:
+    if isinstance(d,dict): d=d.get(k)
+    else: d=None
+print("" if d is None else d)' "$@"; }
+
+api() {
+	local method="$1" path="$2"; shift 2
+	curl -sS --max-time 60 --header "PRIVATE-TOKEN: $TOKEN" \
+		--request "$method" "$API$path" "$@"
+}
+
+run() {
+	if [ "$DRY" = 1 ]; then say "  would: $*"; return 0; fi
+	"$@"
+}
+
+# --- 0. can we talk to it -------------------------------------------------
+step "checking $URL"
+me="$(api GET /user | jget username)"
+[ -n "$me" ] || die "cannot authenticate to $API.
+       Check the URL is reachable and the token has the 'api' scope."
+say "  authenticated as '$me'"
+
+version="$(api GET /version | jget version)"
+say "  GitLab ${version:-(version not reported)}"
+
+# --- 1. project -----------------------------------------------------------
+step "project $PROJECT"
+enc="$(urlenc "$PROJECT")"
+pid="$(api GET "/projects/$enc" | jget id)"
+
+if [ -n "$pid" ]; then
+	say "  already exists (id $pid)"
+else
+	namespace_id=""
+	if [ -n "$GROUP" ]; then
+		namespace_id="$(api GET "/namespaces/$(urlenc "$GROUP")" | jget id)"
+		if [ -z "$namespace_id" ]; then
+			say "  group '$GROUP' does not exist; creating it"
+			namespace_id="$(run api POST /groups \
+				--data-urlencode "name=$GROUP" \
+				--data-urlencode "path=$GROUP" \
+				--data "visibility=private" | jget id)"
+			[ "$DRY" = 1 ] || [ -n "$namespace_id" ] ||
+				die "could not create group '$GROUP'. Create it by hand, or use a token with rights to."
+		fi
+	fi
+	say "  creating project"
+	if [ "$DRY" = 1 ]; then
+		say "  would: POST /projects name=$NAME"
+	else
+		pid="$(api POST /projects \
+			--data-urlencode "name=$NAME" \
+			--data-urlencode "path=$NAME" \
+			${namespace_id:+--data "namespace_id=$namespace_id"} \
+			--data "visibility=private" \
+			--data "initialize_with_readme=false" | jget id)"
+		[ -n "$pid" ] || die "could not create the project. Does '$PROJECT' already exist somewhere you cannot see?"
+		say "  created (id $pid)"
+	fi
+fi
+
+# --- 2. push --------------------------------------------------------------
+step "pushing this repository"
+if [ "$DRY" = 1 ]; then
+	say "  would: git push to $URL/$PROJECT.git"
+else
+	git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || git -C "$REPO_ROOT" init -q -b "$BRANCH"
+	if ! git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+		git -C "$REPO_ROOT" add -A
+		git -C "$REPO_ROOT" -c user.name="${GIT_AUTHOR_NAME:-nsx-terraform}" \
+			-c user.email="${GIT_AUTHOR_EMAIL:-nsx-terraform@localhost}" \
+			commit -q -m "Initial NSX Terraform scaffold"
+		say "  committed the tree"
+	fi
+	# Token in the URL for this push only; never stored.
+	host="${URL#https://}"; host="${host#http://}"
+	scheme="https"; case "$URL" in http://*) scheme="http" ;; esac
+	if git -C "$REPO_ROOT" push -q "$scheme://oauth2:${TOKEN}@${host}/${PROJECT}.git" \
+		"HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+		say "  pushed to $BRANCH"
+	else
+		say "  note: push failed or was already up to date. Push by hand if needed:"
+		say "        git push -u origin $BRANCH"
+	fi
+	if ! git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+		git -C "$REPO_ROOT" remote add origin "$URL/$PROJECT.git"
+		say "  remote 'origin' set to $URL/$PROJECT.git (no token in it)"
+	fi
+fi
+
+# --- 3. CI/CD variables ---------------------------------------------------
+step "CI/CD variables"
+set_var() {
+	local key="$1" value="$2" protected="$3" masked="$4"
+	[ -n "$value" ] || { say "  skip $key (not supplied)"; return 0; }
+	if [ "$DRY" = 1 ]; then say "  would set $key (protected=$protected)"; return 0; fi
+	local existing
+	existing="$(api GET "/projects/$pid/variables/$key" | jget key)"
+	if [ -n "$existing" ]; then
+		api PUT "/projects/$pid/variables/$key" \
+			--data-urlencode "value=$value" \
+			--data "protected=$protected" --data "masked=$masked" >/dev/null &&
+			say "  updated $key"
+	else
+		api POST "/projects/$pid/variables" \
+			--data-urlencode "key=$key" \
+			--data-urlencode "value=$value" \
+			--data "protected=$protected" --data "masked=$masked" >/dev/null &&
+			say "  set $key (protected=$protected, masked=$masked)"
+	fi
+}
+
+set_var VAULT_ADDR "${VAULT_ADDR:-}" false false
+set_var VAULT_PLAN_TOKEN "${VAULT_PLAN_TOKEN:-}" false true
+# Protected, so a feature branch can never reach the write credential.
+set_var VAULT_APPLY_TOKEN "${VAULT_APPLY_TOKEN:-}" true true
+set_var CI_API_TOKEN "${CI_API_TOKEN:-$TOKEN}" false true
+
+if [ -z "${VAULT_ADDR:-}${VAULT_PLAN_TOKEN:-}${VAULT_APPLY_TOKEN:-}" ]; then
+	say ""
+	say "  none of the Vault variables were supplied, so the plan jobs cannot reach"
+	say "  a manager yet. Set them here, or re-run with them in the environment:"
+	say "    $URL/$PROJECT/-/settings/ci_cd"
+fi
+
+# --- 4. protect the default branch ---------------------------------------
+step "protecting '$BRANCH'"
+if [ "$DRY" = 1 ]; then
+	say "  would protect $BRANCH (no direct push, maintainers may merge)"
+else
+	existing="$(api GET "/projects/$pid/protected_branches/$(urlenc "$BRANCH")" | jget name)"
+	if [ -n "$existing" ]; then
+		say "  already protected"
+	else
+		# push_access_level 0 = nobody may push directly; merge 40 = maintainer.
+		api POST "/projects/$pid/protected_branches" \
+			--data-urlencode "name=$BRANCH" \
+			--data "push_access_level=0" \
+			--data "merge_access_level=40" >/dev/null &&
+			say "  protected: no direct pushes, maintainers may merge" ||
+			say "  note: could not protect the branch; do it in Settings -> Repository"
+	fi
+fi
+
+# --- 5. environments for the apply jobs ----------------------------------
+step "environments"
+if [ -f "$REPO_ROOT/inventory/managers.yaml" ] && [ "$DRY" != 1 ]; then
+	rows="$(cd "$REPO_ROOT" && python3 -c "
+import sys
+sys.path.insert(0,'scripts')
+try:
+    from ci_matrix_lib import entries
+except Exception:
+    sys.exit(0)
+for r in entries():
+    print(f\"nsx/{r['site']}/{r['stack']}\")
+" 2>/dev/null)"
+	n=0
+	for env in $rows; do
+		api POST "/projects/$pid/environments" --data-urlencode "name=$env" >/dev/null 2>&1
+		n=$((n + 1))
+	done
+	say "  created or confirmed $n environment(s) from the inventory"
+else
+	say "  skipped (no inventory, or dry run)"
+fi
+
+cat <<SUMMARY
+
+===================================================================
+ $PROJECT is set up
+===================================================================
+
+  Project    $URL/$PROJECT
+  Pipelines  $URL/$PROJECT/-/pipelines
+  Variables  $URL/$PROJECT/-/settings/ci_cd
+
+Still yours to do, because they cannot be set safely from a script:
+
+  * Require an approval on merge requests:
+      Settings -> Merge requests -> Approvals -> at least 1
+  * If this is GitLab Premium or above, mark the nsx/* environments as
+      PROTECTED and choose who may deploy:
+      Settings -> CI/CD -> Protected environments
+    On Free, the gate is the manual apply job plus the protected branch and
+    the protected VAULT_APPLY_TOKEN, which is weaker: anyone who can run a
+    pipeline on the default branch can start the apply.
+  * Register a runner if this project has none:
+      Settings -> CI/CD -> Runners
+
+Then open a merge request with a small rule change and confirm the plan appears
+on it before trusting the pipeline with anything real.
+
+SUMMARY
+SCAFFOLD_EOF
+mark_executable scripts/gitlab-setup.sh
+
 write_file scripts/gitlab-up.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -7290,8 +7669,20 @@ main() {
 
 	TOKEN_SEED="nsxbootstrap$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 	make_root_token
-	create_project
-	push_repository
+
+	# One implementation of "make a GitLab project ready", shared with the path
+	# for a GitLab somebody already has. This script's job is the container.
+	if [ -x "$REPO_ROOT/scripts/gitlab-setup.sh" ]; then
+		GITLAB_TOKEN="$ROOT_TOKEN" "$REPO_ROOT/scripts/gitlab-setup.sh" \
+			--url "$GITLAB_URL" \
+			--token "$ROOT_TOKEN" \
+			--project "root/$PROJECT_NAME" ||
+			say "note: project setup reported a problem; see above."
+	else
+		create_project
+		push_repository
+	fi
+
 	register_runner
 	summary
 }
@@ -9015,7 +9406,7 @@ fi
 
 if [ "$DRY_RUN" != 1 ]; then
 	case "$VCS" in
-	git | github | gitlab)
+	git | github)
 		if [ -n "$GIT_REMOTE" ]; then
 			if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
 				log "git: 'origin' already set to $(git -C "$ROOT" remote get-url origin), left alone"
@@ -9036,6 +9427,37 @@ if [ "$DRY_RUN" != 1 ]; then
 		wants_ci github && log "  .github/workflows/        validate.yml, plan.yml, apply.yml"
 		[ "$CI_PLATFORM" = none ] && log "  (none written — re-run with --ci gitlab or --ci github)"
 		true
+		;;
+	gitlab)
+		if [ -n "$GIT_REMOTE" ]; then
+			if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+				log "git: 'origin' already set to $(git -C "$ROOT" remote get-url origin), left alone"
+			else
+				git -C "$ROOT" remote add origin "$GIT_REMOTE" &&
+					log "git: remote 'origin' set to $GIT_REMOTE"
+			fi
+		fi
+		if [ -n "$GITLAB_URL_ARG" ] && [ -n "$GITLAB_TOKEN_ARG" ] && [ -n "$GITLAB_PROJECT_ARG" ]; then
+			log ""
+			log "setting the GitLab project up..."
+			GITLAB_TOKEN="$GITLAB_TOKEN_ARG" "$ROOT/scripts/gitlab-setup.sh" \
+				--url "$GITLAB_URL_ARG" \
+				--token "$GITLAB_TOKEN_ARG" \
+				--project "$GITLAB_PROJECT_ARG" \
+				--branch "$GIT_BRANCH" ||
+				warn "GitLab setup reported a problem. The repository is complete and
+         unaffected; re-run when ready:
+           scripts/gitlab-setup.sh --url URL --token TOKEN --project group/name"
+		else
+			log ""
+			log "the pipeline is written but nothing was created on GitLab, because no"
+			log "URL, token and project were given. When you have them:"
+			log "  scripts/gitlab-setup.sh --url https://gitlab.example.com \\"
+			log "      --token glpat-xxxx --project group/nsx-terraform"
+			log ""
+			log "that creates the project, pushes, sets the CI variables and protects"
+			log "the default branch. Or push by hand and configure it yourself."
+		fi
 		;;
 	gitlab-docker)
 		log ""
