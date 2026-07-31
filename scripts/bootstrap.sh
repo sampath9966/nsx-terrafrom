@@ -20,7 +20,15 @@ set -euo pipefail
 
 VERSION="1.1.0"
 
-ROOT="$PWD"
+# Default target. Running ./bootstrap.sh from inside a tree's own scripts/
+# directory is the obvious thing to do, and used to scaffold a whole repository
+# INTO scripts/ because the default was simply $PWD. If that is where we are,
+# the repository root is one level up.
+if [ "$(basename "$PWD")" = scripts ] && [ -f "$PWD/bootstrap.sh" ]; then
+	ROOT="$(dirname "$PWD")"
+else
+	ROOT="$PWD"
+fi
 FORCE=0
 FORCE_DATA=0
 DRY_RUN=0
@@ -201,6 +209,24 @@ ARGC=$#
 can_prompt() { { true </dev/tty; } 2>/dev/null; }
 
 say() { printf '%s\n' "$*" >&2; }
+
+# ask_existing_dir <prompt> — like ask, but keeps asking until the path exists.
+# Dying on the first typo is a bad way to treat somebody who has just picked a
+# menu item and mistyped the answer to the next question.
+ask_existing_dir() {
+	local prompt="$1" reply=""
+	while :; do
+		reply="$(ask "$prompt" "$ROOT")"
+		if [ -d "$reply" ]; then
+			printf '%s' "$reply"
+			return 0
+		fi
+		say ""
+		say "  '$reply' does not exist."
+		say "  (If you meant to pick a different menu item, answer n and re-run.)"
+		ask_yes_no "  Try another path?" y || die "cancelled; nothing was written."
+	done
+}
 
 # ask <prompt> <default> — free text, empty input takes the default.
 ask() {
@@ -521,8 +547,7 @@ wizard_advanced() {
 wizard_update() {
 	say ""
 	say "Update an existing tree — take newer generator output."
-	ROOT="$(ask "Directory of the existing repository" "$ROOT")"
-	[ -d "$ROOT" ] || die "$ROOT does not exist. Use option 1 or 2 to create a new tree."
+	ROOT="$(ask_existing_dir "Directory of the existing repository")"
 
 	local ow
 	ow="$(ask_menu 2 "What may this run overwrite?" \
@@ -560,8 +585,7 @@ wizard_update() {
 wizard_migrate() {
 	say ""
 	say "Add version control and the review pipeline to an existing tree."
-	ROOT="$(ask "Directory of the existing repository" "$ROOT")"
-	[ -d "$ROOT" ] || die "$ROOT does not exist. Use option 1 or 2 to create a new tree."
+	ROOT="$(ask_existing_dir "Directory of the existing repository")"
 
 	if [ ! -x "$ROOT/scripts/enable-gitops.sh" ]; then
 		say ""
@@ -866,6 +890,14 @@ file | filesystem | disk | server) BACKEND=local ;;
 minio | ceph) BACKEND=s3 ;;
 azure | blob) BACKEND=azurerm ;;
 esac
+
+# Even with an explicit --dir: scaffolding into a scripts/ directory that holds
+# this script is almost certainly a mistake, and not obvious afterwards.
+if [ "$(basename "$ROOT")" = scripts ] && [ -f "$ROOT/bootstrap.sh" ]; then
+	warn "target is $ROOT, which looks like a tree's own scripts/ directory.
+         That would put a whole repository inside scripts/. You probably want
+         $(dirname "$ROOT") — pass --dir explicitly if you really meant this."
+fi
 
 case "$BACKEND" in
 local | http | s3 | azurerm) ;;
