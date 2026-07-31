@@ -56,8 +56,13 @@ Consequences for you:
 - As real code lands, **replace** the speculative parts of this file with what
   was actually built. Prune what turned out not to apply.
 
-The repository name `nsx-terrafrom` contains a typo for "terraform". Reproduce
-it verbatim in remotes and CI config; renaming is the owner's call.
+The repository was renamed from `nsx-terrafrom` to `nsx-terraform`, correcting a
+typo. GitHub redirects the old path, so an existing clone keeps working, but
+update remotes and CI config when convenient:
+
+```bash
+git remote set-url origin https://github.com/sampath9966/nsx-terraform.git
+```
 
 ---
 

@@ -28,8 +28,8 @@ back to this repository.
 ## 1. Generate
 
 ```bash
-git clone https://github.com/sampath9966/nsx-terrafrom
-./nsx-terrafrom/scripts/bootstrap.sh
+git clone https://github.com/sampath9966/nsx-terraform
+./nsx-terraform/scripts/bootstrap.sh
 ```
 
 With no arguments it asks what you want:
@@ -62,7 +62,7 @@ Everything is also available directly, and **any flag suppresses the menu** —
 which is what keeps CI working:
 
 ```bash
-./nsx-terrafrom/scripts/bootstrap.sh --dir ~/work/nsx-estate --backend gitlab
+./nsx-terraform/scripts/bootstrap.sh --dir ~/work/nsx-estate --backend gitlab
 ./scripts/bootstrap.sh --dry-run          # report every file, write nothing
 ./scripts/bootstrap.sh --interactive      # force the menu anyway
 ./scripts/bootstrap.sh --no-interactive   # never prompt, even with a terminal
