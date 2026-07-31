@@ -20,15 +20,10 @@ set -euo pipefail
 
 VERSION="1.1.0"
 
-# Default target. Running ./bootstrap.sh from inside a tree's own scripts/
-# directory is the obvious thing to do, and used to scaffold a whole repository
-# INTO scripts/ because the default was simply $PWD. If that is where we are,
-# the repository root is one level up.
-if [ "$(basename "$PWD")" = scripts ] && [ -f "$PWD/bootstrap.sh" ]; then
-	ROOT="$(dirname "$PWD")"
-else
-	ROOT="$PWD"
-fi
+# Empty until after the arguments are parsed: the default depends on where we
+# are, and working that out needs the helpers defined further down.
+ROOT=""
+ROOT_EXPLICIT=0
 FORCE=0
 FORCE_DATA=0
 DRY_RUN=0
@@ -121,8 +116,17 @@ Options:
   -i, --interactive   Force the menu even when other flags are given.
       --no-interactive
                       Never show the menu; use defaults and the flags given.
-  -d, --dir PATH      Target directory (default: current working directory).
-                      Created if it does not exist.
+  -d, --dir PATH      Target directory. Created if it does not exist.
+
+                      Without it, the target is the ROOT of the repository the
+                      current directory is inside — found by walking up for a
+                      scripts/bootstrap.sh. Running from scripts/, docs/ or
+                      modules/group/ all act on the same root, so a repository
+                      cannot be scaffolded into one of its own subdirectories by
+                      accident. It says which root it chose.
+
+                      Outside any repository the target is the current
+                      directory, which is how a new tree gets scaffolded.
   -f, --force         Overwrite existing REGENERATED files whose content
                       differs — modules, stacks, scripts, CI, schemas, docs.
                       Never touches estate data. This is the flag to use when
@@ -207,6 +211,28 @@ ARGC=$#
 # ---------------------------------------------------------------------------
 
 can_prompt() { { true </dev/tty; } 2>/dev/null; }
+
+# find_tree_root <dir> — the root of the repository <dir> sits inside, or
+# nothing. A root is a directory holding scripts/bootstrap.sh, which is true of
+# this repository and of every tree it generates, since the script copies itself
+# in.
+#
+# This is what makes the location you happen to be standing in irrelevant.
+# Running from scripts/, from docs/, or from modules/group/ all resolve to the
+# same root, so a repository can never be scaffolded into one of its own
+# subdirectories by accident.
+find_tree_root() {
+	local d="${1:-$PWD}"
+	d="$(cd "$d" 2>/dev/null && pwd)" || return 1
+	while :; do
+		[ -f "$d/scripts/bootstrap.sh" ] && {
+			printf '%s' "$d"
+			return 0
+		}
+		[ "$d" = / ] && return 1
+		d="$(dirname "$d")"
+	done
+}
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -642,10 +668,12 @@ while [ $# -gt 0 ]; do
 	-d | --dir)
 		[ $# -ge 2 ] || die "--dir requires a path"
 		ROOT="$2"
+		ROOT_EXPLICIT=1
 		shift 2
 		;;
 	--dir=*)
 		ROOT="${1#*=}"
+		ROOT_EXPLICIT=1
 		shift
 		;;
 	-f | --force)
@@ -871,6 +899,35 @@ wants_ci() {
 	esac
 }
 
+# --- where are we, and what should we act on -------------------------------
+#
+# Without --dir, the target is the root of the repository the current directory
+# is inside — not the current directory. Standing in scripts/ and running
+# ./bootstrap.sh used to mean "scaffold a repository into scripts/", which is
+# never what anyone means.
+if [ -z "$ROOT" ]; then
+	if detected_root="$(find_tree_root "$PWD")"; then
+		ROOT="$detected_root"
+		if [ "$ROOT" != "$PWD" ]; then
+			log "note: run from ${PWD}"
+			log "      targeting the repository root: $ROOT"
+			log "      (pass --dir to act on somewhere else)"
+			log ""
+		fi
+	else
+		# Not inside a repository: this is a fresh scaffold into where we stand.
+		ROOT="$PWD"
+	fi
+elif enclosing_root="$(find_tree_root "$ROOT" 2>/dev/null)"; then
+	# --dir is honoured, but pointing it at a subdirectory of a repository is
+	# almost always a slip, and the result is not obvious afterwards.
+	if [ "$enclosing_root" != "$(cd "$ROOT" 2>/dev/null && pwd)" ]; then
+		warn "--dir is $ROOT, which is inside the repository at $enclosing_root.
+         That will build a second repository in a subdirectory of the first.
+         Use --dir '$enclosing_root' if you meant to act on the repository."
+	fi
+fi
+
 # The menu runs on --interactive, or when invoked bare with a terminal present.
 # A single flag suppresses it: flags mean a script, and a script must not block.
 if [ "$INTERACTIVE" = 1 ]; then
@@ -890,14 +947,6 @@ file | filesystem | disk | server) BACKEND=local ;;
 minio | ceph) BACKEND=s3 ;;
 azure | blob) BACKEND=azurerm ;;
 esac
-
-# Even with an explicit --dir: scaffolding into a scripts/ directory that holds
-# this script is almost certainly a mistake, and not obvious afterwards.
-if [ "$(basename "$ROOT")" = scripts ] && [ -f "$ROOT/bootstrap.sh" ]; then
-	warn "target is $ROOT, which looks like a tree's own scripts/ directory.
-         That would put a whole repository inside scripts/. You probably want
-         $(dirname "$ROOT") — pass --dir explicitly if you really meant this."
-fi
 
 case "$BACKEND" in
 local | http | s3 | azurerm) ;;

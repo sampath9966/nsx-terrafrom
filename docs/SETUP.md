@@ -76,6 +76,22 @@ which is what keeps CI working:
 | To build on top of this one | Run it in place, in a clone: `./scripts/bootstrap.sh`. Generator and generated tree share a history. |
 | To evaluate first | `--dir /tmp/try --dry-run`, then without `--dry-run`. Throw it away after. |
 
+**Where it acts, when you do not say.** Without `--dir` the target is the *root*
+of the repository your current directory is inside, found by walking up for a
+`scripts/bootstrap.sh`. So these are all equivalent:
+
+```bash
+cd ~/work/nsx-estate         && ./scripts/bootstrap.sh
+cd ~/work/nsx-estate/scripts && ./bootstrap.sh
+cd ~/work/nsx-estate/docs    && ../scripts/bootstrap.sh
+```
+
+and it prints which root it chose. Outside any repository the target is the
+current directory — that is how a new tree gets created. Pointing `--dir` at a
+subdirectory of an existing repository still works but warns, because building a
+second repository inside the first is almost never intended and is not obvious
+afterwards.
+
 The generator copies itself and `docs/ARCHITECTURE.md` into the tree it creates,
 so the result is standalone: it can regenerate and update itself with no link
 back to here.
