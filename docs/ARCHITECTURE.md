@@ -946,6 +946,8 @@ make help              # list targets
 make preflight         # which required tools are present
 make ready             # production readiness: exits 1 while anything blocks
 make selftest          # prove the generator and validators, offline
+make update-check      # is there a newer generator, and what changed?
+make update            # take it, after showing the diff
 make validate          # schema-validate + fmt-check. Offline, no credentials.
 make schema-validate   # data/ and inventory/ only
 make fmt               # terraform fmt -recursive .
@@ -973,6 +975,7 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/tf.sh init\|plan\|show\|apply STACK SITE` | Terraform for one stack against one manager. `-parallelism=5`; override with `PARALLELISM`. |
 | `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
 | `scripts/preflight.sh` | Reports missing tools. Read-only. |
+| `scripts/update.sh [--check\|--from SRC\|--yes]` | Takes a newer generator into this tree. Reads the version and source recorded in `.nsx-bootstrap.conf`, shows the changelog since your version and a dry-run diff, then applies with `--force` — so `data/`, `inventory/` and `envs/` are never touched. Refuses a dirty working tree, refuses to downgrade, and shouts about a major version change. |
 | `scripts/selftest.sh [--quick]` | Proves what can be proved offline: the generator, every validator against planted defects, terraform fmt and validate, pipeline shape (no apply on a merge request, every apply manual), determinism, the overwrite guard, and that readiness refuses a fresh tree. 34 checks. Exits 1 on the first failure. |
 | `scripts/readiness.sh [--quiet]` | Answers "is this ready for production": placeholder backend, missing lock files, example data still in place, no remote, state tracked in git, validation failing. Exits 1 while anything blocks. Also prints what it *cannot* check — branch protection, CI variables, and whether a plan has ever run against a manager. |
 | `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
