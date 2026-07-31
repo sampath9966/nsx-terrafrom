@@ -940,6 +940,7 @@ is never overwritten by this script, by any flag or phrase.
 make help              # list targets
 make preflight         # which required tools are present
 make ready             # production readiness: exits 1 while anything blocks
+make selftest          # prove the generator and validators, offline
 make validate          # schema-validate + fmt-check. Offline, no credentials.
 make schema-validate   # data/ and inventory/ only
 make fmt               # terraform fmt -recursive .
@@ -967,6 +968,7 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/tf.sh init\|plan\|show\|apply STACK SITE` | Terraform for one stack against one manager. `-parallelism=5`; override with `PARALLELISM`. |
 | `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
 | `scripts/preflight.sh` | Reports missing tools. Read-only. |
+| `scripts/selftest.sh [--quick]` | Proves what can be proved offline: the generator, every validator against planted defects, terraform fmt and validate, pipeline shape (no apply on a merge request, every apply manual), determinism, the overwrite guard, and that readiness refuses a fresh tree. 34 checks. Exits 1 on the first failure. |
 | `scripts/readiness.sh [--quiet]` | Answers "is this ready for production": placeholder backend, missing lock files, example data still in place, no remote, state tracked in git, validation failing. Exits 1 while anything blocks. Also prints what it *cannot* check — branch protection, CI variables, and whether a plan has ever run against a manager. |
 | `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
 | `scripts/tag-vm.py --site S --vm V --set SCOPE=VALUE` | Tags a VM as a data edit on `data/vm-tags/<site>.yaml`. Also `--unset SCOPE`, `--remove`, `--list`, `--dry-run`. Refuses any scope not owned by `terraform` in the vocabulary, and refuses to leave a VM with an empty tag set. |

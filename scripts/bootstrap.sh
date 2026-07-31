@@ -1191,6 +1191,10 @@ preflight: ## Check that the tools this repository needs are present
 ready: ## Is this repository ready to apply to a production estate? Exits 1 if not.
 	@scripts/readiness.sh
 
+.PHONY: selftest
+selftest: ## Prove the generator and validators work. Offline. Exits 1 on any failure.
+	@scripts/selftest.sh
+
 .PHONY: validate
 validate: schema-validate fmt-check ## Run every offline check (no credentials, no network)
 
@@ -1490,6 +1494,7 @@ refreshes a transport zone:
 
 ```bash
 make preflight     # are the tools here
+make selftest      # prove the generator and validators. Offline, ~1 minute.
 make validate      # schema + convention checks. Offline, no credentials.
 make ready         # what still stands between this and production
 make matrix        # what CI would run, derived from the inventory
@@ -1526,6 +1531,7 @@ describing no real site. Replace it, or regenerate with `--no-examples`.
 | `docs/IMPORT.md` | Adopting an estate that already exists — the tranche workflow. |
 | `docs/SETUP.md` | Standing this up end to end: prerequisites, the decisions that are yours, backend choice, first contact with a manager. |
 | `docs/GITOPS.md` | How a rule edit becomes a merge request, a plan, an approval and an apply — and what the approver is looking for. |
+| `docs/ACCEPTANCE.md` | **What "it works" means and how to prove it** — the staged plan from offline checks to a real apply. Read before promising this to anyone. |
 | `deploy/gitlab/README.md` | Running a local GitLab in Docker, if you do not have one. |
 | `modules/*/README.md` | Input shape and gotchas, one per module. |
 | `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
@@ -1605,6 +1611,215 @@ git is the real undo.
 
 Read `docs/ARCHITECTURE.md` section 2 — ten things that will break this
 repository — before the first change.
+SCAFFOLD_EOF
+
+write_file docs/ACCEPTANCE.md <<'SCAFFOLD_EOF'
+# What "it works" means, and how to prove it
+
+`make selftest` proves the generator and the validators, offline, in about a
+minute. It proves nothing about GitLab, Vault or NSX, because it never talks to
+them.
+
+This document is the rest: the stages that need real infrastructure, in the
+order that keeps a mistake cheap. **Nothing below has been done yet.** Until
+someone works through it, this repository is a well-tested scaffold, not a
+deployment.
+
+## First, about "single click"
+
+It cannot be one click, and the honest reason is worth stating before anyone
+promises it to a team.
+
+A single command can create a repository, push it, configure a pipeline and
+protect a branch. It cannot decide which state backend your organisation will
+support, obtain a Vault path and a token, know which NSX manager is safe to
+point at first, or accept the risk of the first apply. Those are decisions and
+credentials, not steps.
+
+What *is* achievable, and what to aim for:
+
+- **One command to a reviewable pipeline.** `scripts/bootstrap.sh` with the
+  GitLab flags creates the project, pushes, sets the variables and protects the
+  branch. Reachable today; unproven until stage 2 below.
+- **One merge request to a firewall change.** Edit a file, get a plan, approve,
+  merge, apply. That is the actual product.
+
+Say "one command to get started, one merge request per change". Do not say
+"single click" — the first person to hit the Vault question will stop trusting
+everything else you said.
+
+---
+
+## Stage 0 — offline, no infrastructure
+
+```bash
+make selftest      # generator, validators, pipeline shape, guards
+make validate      # your data specifically
+make ready         # what still blocks production
+```
+
+**Pass:** `selftest` exits 0. `ready` exits 1 and the reasons are all things you
+have not done yet rather than things that are broken.
+
+Cost: minutes. Do this on every change to the generator, and in CI.
+
+---
+
+## Stage 1 — a GitLab you can throw away
+
+Prove the pipeline definition is one GitLab accepts, before it matters.
+
+```bash
+scripts/gitlab-up.sh                    # local GitLab in Docker, ~4 GB RAM
+# or point at a sandbox project on a GitLab you already have:
+scripts/gitlab-setup.sh --url https://gitlab.example.com \
+                        --token glpat-xxxx --project sandbox/nsx-test
+```
+
+**Prove, in order:**
+
+1. The project exists and the tree is in it.
+2. `.gitlab-ci.yml` **lints** — Settings → CI/CD → Pipeline editor, or
+   `POST /api/v4/projects/:id/ci/lint`. Valid YAML is not a valid pipeline;
+   this is the first place the generated child pipeline can be rejected.
+3. A pipeline runs on a push and the `validate` stage goes green with no
+   credentials configured. This proves the offline half works on a runner.
+4. The `matrix` job produces a child pipeline and the `managers` job triggers it.
+   Plan jobs will **fail** here — there are no credentials yet. That is expected;
+   what you are proving is that the jobs exist and are named per manager.
+5. The default branch is protected and `VAULT_APPLY_TOKEN` is marked protected.
+
+**Pass:** validate green, child pipeline generated and triggered, one plan job
+per manager per stack, apply jobs present but manual and not startable from a
+merge request.
+
+**Fail here means:** the pipeline shape is wrong. Fix it before anyone points it
+at a manager.
+
+---
+
+## Stage 2 — state backend, no NSX
+
+Prove Terraform can hold state before it holds your firewall.
+
+```bash
+scripts/bootstrap.sh --force --backend gitlab   # or s3 / azure
+# fill in envs/<site>.backend.hcl, then:
+terraform -chdir=stacks/local-security init -backend-config=../../envs/lon1.backend.hcl
+```
+
+**Prove:**
+
+1. `init` succeeds against the real backend.
+2. A `.terraform.lock.hcl` is produced and **committed**.
+3. **Locking works.** Start a plan, and while it runs start another against the
+   same state. The second must block or fail, not proceed. This is the check
+   nobody does and the one that corrupts state when it is missing.
+4. State is encrypted at rest and readable only by the pipeline identity.
+
+**Pass:** two concurrent runs cannot both hold the lock.
+
+---
+
+## Stage 3 — credentials
+
+```bash
+scripts/with-credentials.sh lon1 -- env | grep -c NSXT_
+```
+
+**Prove:**
+
+1. It resolves the Vault path from the inventory and exports `NSXT_*`.
+2. Nothing lands on disk: no file under the repository contains the secret
+   after the command exits.
+3. The plan token is **read-only** — confirm by trying a write against NSX with
+   it and being refused. A token you assume is read-only is not read-only.
+
+**Pass:** credentials reach the process, nothing reaches the disk, and the plan
+identity cannot write.
+
+---
+
+## Stage 4 — a plan against a real NSX manager
+
+The first stage where the product is actually being tested, and the first with
+a blast radius. Use a **non-production Local Manager**.
+
+```bash
+scripts/with-credentials.sh lon1 -- scripts/tf.sh plan local-security lon1
+scripts/tf.sh show local-security lon1
+```
+
+**Prove:**
+
+1. `plan` completes. Provider schema validity is not API validity — this is
+   where a wrong argument name, a wrong id format or a wrong domain shows up.
+2. Against an estate you have **imported**, the plan reports **no changes**.
+   Any *create* means an id did not match and Terraform is about to build a
+   duplicate. Stop.
+3. Against a greenfield site, the plan creates exactly what the data describes
+   and nothing else.
+
+**Pass:** an imported tranche plans clean. This is the single most important
+line in this document.
+
+---
+
+## Stage 5 — the loop, end to end
+
+On the non-production site, with a trivial change — one rule, one narrow scope.
+
+1. Branch, edit one file in `data/policies/`, push, open a merge request.
+2. **The plan appears as a comment on the merge request.** If it does not,
+   `CI_API_TOKEN` is missing; the pipeline still works, the review is worse.
+3. A second person approves. Confirm the author cannot approve their own.
+4. Merge. The apply job appears and is **manual**.
+5. Start it. It applies the **saved plan**, not a fresh one.
+6. Confirm the rule exists in NSX and matches what the plan said.
+7. Re-run the plan. It must report **no changes** — an apply that is not
+   idempotent is an apply you cannot trust.
+8. Revert the merge request and confirm the rule is removed.
+
+**Pass:** steps 6, 7 and 8. Especially 7.
+
+---
+
+## Stage 6 — before an organisation consumes it
+
+Technical correctness is not readiness for other people.
+
+| Question | Who answers it |
+|---|---|
+| Who may approve a firewall change? | security owner |
+| Who may start an apply, and out of hours? | change management |
+| Where is state backed up, and how is it restored? | platform owner |
+| What happens when CI is down and a change is urgent? | you — document it |
+| Who is called when an apply half-fails? | on-call |
+| Which site is the pilot, and when does it widen? | change advisory |
+
+Also run once, deliberately:
+
+- **A rollback.** Revert a merged change and apply the revert. Time it.
+- **A broken apply.** Kill an apply mid-run and recover the state lock.
+- **An onboarding.** Hand `docs/SETUP.md` to somebody who has not seen this
+  and watch where they get stuck, without helping. Fix those places.
+
+---
+
+## The shortest honest summary
+
+| Stage | Needs | Proves | Status |
+|---|---|---|---|
+| 0 | nothing | generator and validators | **done** — `make selftest`, 34 checks |
+| 1 | any GitLab | the pipeline is one GitLab accepts | not started |
+| 2 | a state backend | state is held and locked | not started |
+| 3 | Vault | credentials flow, nothing on disk | not started |
+| 4 | a non-prod NSX manager | plan matches reality | not started |
+| 5 | all of the above | the review loop works end to end | not started |
+| 6 | people | the organisation can run it | not started |
+
+Stage 4 is the one that decides whether any of this is real. Everything before
+it is preparation; everything after it is process.
 SCAFFOLD_EOF
 
 write_file docs/GITOPS.md <<'SCAFFOLD_EOF'
@@ -7690,6 +7905,305 @@ main() {
 main "$@"
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-up.sh
+
+write_file scripts/selftest.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Prove this repository does what it claims — everything that can be proved
+# without a GitLab, a Vault or an NSX manager.
+#
+#   scripts/selftest.sh           full run
+#   scripts/selftest.sh --quick   skip terraform init/validate (the slow part)
+#
+# Run it before trusting the generator, after changing it, and in CI. It exits
+# non-zero on the first thing that is not true.
+#
+# What it CANNOT prove is listed at the end, and in docs/ACCEPTANCE.md: nothing
+# here talks to a real GitLab, a real Vault, or a real NSX manager, so a green
+# run means "the generator and the validators are correct", not "this is safe to
+# apply to your estate".
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BOOTSTRAP="$REPO_ROOT/scripts/bootstrap.sh"
+QUICK=0
+[ "${1:-}" = "--quick" ] && QUICK=1
+
+pass=0
+fail=0
+skip=0
+WORK=""
+
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT
+
+ok() {
+	pass=$((pass + 1))
+	printf '  PASS  %s\n' "$*"
+}
+bad() {
+	fail=$((fail + 1))
+	printf '  FAIL  %s\n' "$*"
+}
+skipped() {
+	skip=$((skip + 1))
+	printf '  SKIP  %s\n' "$*"
+}
+phase() { printf '\n== %s\n' "$*"; }
+
+[ -x "$BOOTSTRAP" ] || {
+	printf 'error: %s is missing or not executable\n' "$BOOTSTRAP" >&2
+	exit 1
+}
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/nsx-selftest.XXXXXX")"
+A="$WORK/a"
+B="$WORK/b"
+C="$WORK/c"
+mkdir -p "$A" "$B" "$C"
+
+# --------------------------------------------------------------------------
+phase "1. the generator produces a tree"
+
+if "$BOOTSTRAP" --dir "$A" --vcs none --quiet </dev/null >"$WORK/gen.log" 2>&1; then
+	n="$(find "$A" -type f | wc -l | tr -d ' ')"
+	[ "$n" -gt 80 ] && ok "generated $n files" || bad "only $n files generated"
+else
+	bad "generator exited non-zero — see $WORK/gen.log"
+fi
+
+for f in Makefile README.md docs/ARCHITECTURE.md scripts/validate-data.py \
+	stacks/global-security/main.tf modules/dfw-policy/main.tf; do
+	[ -f "$A/$f" ] && ok "present: $f" || bad "missing: $f"
+done
+
+# --------------------------------------------------------------------------
+phase "2. shell and python syntax"
+
+syn=0
+for f in "$A"/scripts/*.sh; do bash -n "$f" 2>/dev/null || { bad "bash -n $f"; syn=1; }; done
+for f in "$A"/scripts/*.py; do python3 -m py_compile "$f" 2>/dev/null || { bad "py_compile $f"; syn=1; }; done
+[ "$syn" = 0 ] && ok "every generated script parses"
+
+# --------------------------------------------------------------------------
+phase "3. data validation"
+
+if (cd "$A" && python3 scripts/validate-data.py >/dev/null 2>&1); then
+	ok "validate-data.py passes on the example data"
+else
+	bad "validate-data.py fails on its own example data"
+fi
+
+# Planted defects. Each must be caught, or the validator is decoration.
+plant() {
+	local label="$1" file="$2" find_s="$3" repl="$4" expect="$5"
+	local tmp="$WORK/plant"
+	rm -rf "$tmp" && cp -r "$A" "$tmp"
+	python3 - "$tmp/$file" "$find_s" "$repl" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+if sys.argv[2] not in t:
+    sys.exit(3)
+p.write_text(t.replace(sys.argv[2], sys.argv[3], 1))
+PY
+	case $? in
+	3)
+		skipped "$label (anchor not found)"
+		return 0
+		;;
+	esac
+	# Capture, then match. Piping straight into grep would be wrong under
+	# 'set -o pipefail': validate-data.py exits 1 precisely when it has found
+	# the defect, so the pipeline would report failure on success.
+	local out
+	out="$(cd "$tmp" && python3 scripts/validate-data.py 2>&1)"
+	if printf '%s' "$out" | grep -q "$expect"; then
+		ok "caught: $label"
+	else
+		bad "NOT caught: $label"
+	fi
+}
+
+plant "tag scope owned by another system" \
+	data/vm-tags/lon1.yaml "scope: workload" "scope: app" "owned by"
+plant "unknown tag scope" \
+	data/vm-tags/lon1.yaml "scope: workload" "scope: wrokload" "not in data/schema"
+plant "duplicate sequence number" \
+	data/policies/payments.yaml "sequence_number: 200" "sequence_number: 100" "already used"
+plant "undefined group reference" \
+	data/policies/payments.yaml "source_groups: [prod-payments-web]" \
+	"source_groups: [does-not-exist]" "undefined group"
+plant "credential in a data file" \
+	inventory/managers.yaml "vault_path:" "password: hunter2
+    vault_path:" "looks like a credential"
+
+# --------------------------------------------------------------------------
+phase "4. terraform"
+
+if ! command -v terraform >/dev/null 2>&1; then
+	skipped "terraform not installed — fmt and validate not run"
+elif [ "$QUICK" = 1 ]; then
+	if (cd "$A" && terraform fmt -recursive -check . >/dev/null 2>&1); then
+		ok "terraform fmt is clean"
+	else
+		bad "terraform fmt reports changes"
+	fi
+	skipped "terraform validate (--quick)"
+else
+	if (cd "$A" && terraform fmt -recursive -check . >/dev/null 2>&1); then
+		ok "terraform fmt is clean"
+	else
+		bad "terraform fmt reports changes"
+	fi
+	for s in "$A"/stacks/*/; do
+		name="$(basename "$s")"
+		if terraform -chdir="$s" init -backend=false -input=false >/dev/null 2>&1 &&
+			terraform -chdir="$s" validate >/dev/null 2>&1; then
+			ok "terraform validate: $name"
+		else
+			bad "terraform validate: $name"
+		fi
+	done
+fi
+
+# --------------------------------------------------------------------------
+phase "5. generated YAML and pipelines"
+
+ymls=0
+for f in "$A"/.gitlab-ci.yml "$A"/.github/workflows/*.yml "$A"/deploy/gitlab/docker-compose.yml; do
+	[ -f "$f" ] || continue
+	ymls=$((ymls + 1))
+	python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f" 2>/dev/null ||
+		bad "not valid YAML: ${f#"$A"/}"
+done
+[ "$ymls" -gt 0 ] && ok "$ymls generated YAML file(s) parse"
+
+# A GitLab tree, so the child pipeline can be exercised.
+G="$WORK/gitlab"
+mkdir -p "$G"
+if "$BOOTSTRAP" --dir "$G" --ci gitlab --vcs none --quiet </dev/null >/dev/null 2>&1; then
+	mr="$(cd "$G" && python3 scripts/gitlab-child-pipeline.py 2>/dev/null)"
+	main="$(cd "$G" && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py 2>/dev/null)"
+
+	printf '%s' "$mr" | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" 2>/dev/null &&
+		ok "merge-request pipeline is valid YAML" || bad "merge-request pipeline is not valid YAML"
+	printf '%s' "$main" | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" 2>/dev/null &&
+		ok "default-branch pipeline is valid YAML" || bad "default-branch pipeline is not valid YAML"
+
+	# The safety property: a merge request must never be able to apply.
+	if printf '%s' "$mr" | grep -q '^"apply'; then
+		bad "merge-request pipeline contains apply jobs — it must not"
+	else
+		ok "no apply jobs on a merge request"
+	fi
+
+	napply="$(printf '%s' "$main" | grep -c '^"apply' || true)"
+	nmanual="$(printf '%s' "$main" | grep -c 'when: manual' || true)"
+	if [ "$napply" -gt 0 ] && [ "$napply" = "$nmanual" ]; then
+		ok "every apply job on the default branch is manual ($napply)"
+	else
+		bad "apply jobs: $napply, manual gates: $nmanual — they must match"
+	fi
+
+	if printf '%s' "$main" | grep -q 'VAULT_APPLY_TOKEN' &&
+		printf '%s' "$mr" | grep -qv 'VAULT_APPLY_TOKEN'; then
+		ok "the write credential appears only in apply jobs"
+	fi
+else
+	bad "could not generate a GitLab tree"
+fi
+
+# --------------------------------------------------------------------------
+phase "6. the generator is deterministic"
+
+if "$A/scripts/bootstrap.sh" --dir "$B" --vcs none --quiet </dev/null >/dev/null 2>&1 &&
+	"$B/scripts/bootstrap.sh" --dir "$C" --vcs none --quiet </dev/null >/dev/null 2>&1; then
+	rm -rf "$B/.git" "$C/.git"
+	if diff -r "$B" "$C" >/dev/null 2>&1; then
+		ok "two generations are byte identical"
+	else
+		bad "generations differ — the generator is not deterministic"
+	fi
+else
+	bad "could not regenerate from a generated tree"
+fi
+
+# Re-running in place must change nothing.
+before="$(cd "$A" && find . -type f -newer "$A/Makefile" | wc -l | tr -d ' ')"
+if (cd "$A" && ./scripts/bootstrap.sh --dir . --quiet </dev/null >/dev/null 2>&1); then
+	ok "re-running in place succeeds"
+else
+	bad "re-running in place failed"
+fi
+
+# --------------------------------------------------------------------------
+phase "7. the overwrite guard"
+
+edited="$A/modules/group/main.tf"
+printf '\n# deliberate local edit\n' >>"$edited"
+sum_before="$(cksum <"$edited")"
+
+(cd "$A" && ./scripts/bootstrap.sh --dir . --quiet </dev/null >/dev/null 2>&1)
+[ "$(cksum <"$edited")" = "$sum_before" ] &&
+	ok "no flag: an edited file is untouched" || bad "no flag: an edited file was overwritten"
+
+(cd "$A" && ./scripts/bootstrap.sh --dir . --force </dev/null >/dev/null 2>&1)
+[ "$(cksum <"$edited")" = "$sum_before" ] &&
+	ok "--force with no phrase: still untouched" || bad "--force with no phrase: file was overwritten"
+
+(cd "$A" && ./scripts/bootstrap.sh --dir . --force --confirm 'wrong phrase' >/dev/null 2>&1)
+[ "$(cksum <"$edited")" = "$sum_before" ] &&
+	ok "--force with the wrong phrase: still untouched" || bad "wrong phrase overwrote the file"
+
+(cd "$A" && ./scripts/bootstrap.sh --dir . --force --confirm 'wipe everything & start fresh' --quiet >/dev/null 2>&1)
+[ "$(cksum <"$edited")" != "$sum_before" ] &&
+	ok "--force with the phrase: file is refreshed" || bad "the phrase did not overwrite the file"
+
+# Estate data must survive --force.
+data_file="$A/data/groups/payments.yaml"
+if [ -f "$data_file" ]; then
+	printf '\n# local data edit\n' >>"$data_file"
+	d_before="$(cksum <"$data_file")"
+	(cd "$A" && ./scripts/bootstrap.sh --dir . --force --confirm 'wipe everything & start fresh' --quiet >/dev/null 2>&1)
+	[ "$(cksum <"$data_file")" = "$d_before" ] &&
+		ok "--force never touches estate data" || bad "--force overwrote estate data"
+fi
+
+# --------------------------------------------------------------------------
+phase "8. readiness reports honestly"
+
+R="$WORK/ready"
+mkdir -p "$R"
+"$BOOTSTRAP" --dir "$R" --quiet </dev/null >/dev/null 2>&1
+if (cd "$R" && ./scripts/readiness.sh >/dev/null 2>&1); then
+	bad "readiness says a fresh tree is production ready — it is not"
+else
+	ok "readiness exits non-zero on a fresh tree"
+fi
+
+# --------------------------------------------------------------------------
+printf '\n===========================================================\n'
+printf 'selftest: %s passed, %s failed, %s skipped\n' "$pass" "$fail" "$skip"
+
+cat <<'NOTE'
+
+This proves the generator and the validators. It does NOT prove:
+
+  * that GitLab starts, or that the project setup works against a real API
+  * that a pipeline runs, or that a runner picks it up
+  * that terraform init works against a real state backend
+  * that terraform plan works against a real NSX manager
+  * that an apply does what the plan said
+
+Those need real infrastructure. docs/ACCEPTANCE.md is the plan for them.
+NOTE
+
+[ "$fail" -eq 0 ] || exit 1
+exit 0
+SCAFFOLD_EOF
+mark_executable scripts/selftest.sh
 
 write_file scripts/readiness.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
