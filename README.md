@@ -1,4 +1,4 @@
-# nsx-terrafrom
+# nsx-terraform
 
 Terraform for **NSX across a multi-VCF estate** — one Global Manager owning the
 federated distributed firewall, 10+ Local Managers owning their own networking,
@@ -36,8 +36,8 @@ Any flag on the command line suppresses the menu, so CI is unaffected.
 
 `docs/SETUP.md` walks the whole thing, including the choices you have to make.
 
-> The repository name contains a typo for "terraform". It is reproduced verbatim
-> in remotes and CI config; renaming is the owner's call.
+> Renamed from `nsx-terrafrom`; GitHub redirects the old path, so existing
+> clones keep working. `git remote set-url origin` when convenient.
 
 ## What problem it solves
 
