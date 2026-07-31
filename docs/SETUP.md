@@ -29,14 +29,43 @@ back to this repository.
 
 ```bash
 git clone https://github.com/sampath9966/nsx-terrafrom
-./nsx-terrafrom/scripts/bootstrap.sh --dir ~/work/nsx-estate
-cd ~/work/nsx-estate
+./nsx-terrafrom/scripts/bootstrap.sh
 ```
 
-Look before you leap:
+With no arguments it asks what you want:
+
+```
+ 1) Basic deployment      — best practices assumed, four questions
+ 2) Advanced deployment   — every option asked
+ 3) Update an existing tree
+ 4) Add version control and the review pipeline to an existing tree
+ 5) Dry run               — show what a basic run would write
+ 6) Help                  — list every flag
+ 7) Quit
+```
+
+- **Basic** asks four things: the directory, **where the files live and how
+  changes get reviewed**, the state backend, and whether to include the worked
+  example data. Everything else takes the recommended answer — `git init` on a
+  tree that is not already one, and never overwrite.
+- **Advanced** asks about every flag, including what the run is allowed to
+  overwrite and whether to dry-run first.
+- **Update an existing tree** is the day-two path: it keeps the backend the tree
+  already uses, never re-seeds example data, and offers a dry run first.
+- **Add version control and the review pipeline** is the migration path for a
+  tree set up without either.
+
+They print the equivalent command line before writing anything, so a single pass
+through the menu gives you the scripted form to put in a runbook.
+
+Everything is also available directly, and **any flag suppresses the menu** —
+which is what keeps CI working:
 
 ```bash
-./scripts/bootstrap.sh --dry-run     # report every file, write nothing
+./nsx-terrafrom/scripts/bootstrap.sh --dir ~/work/nsx-estate --backend gitlab
+./scripts/bootstrap.sh --dry-run          # report every file, write nothing
+./scripts/bootstrap.sh --interactive      # force the menu anyway
+./scripts/bootstrap.sh --no-interactive   # never prompt, even with a terminal
 ```
 
 ### Where it goes — three shapes
@@ -67,20 +96,67 @@ With examples, replace `inventory/managers.yaml` and everything under `data/`
 before you go near a manager. The example inventory uses `gm1`, `lon1`, `nyc1`,
 `fra1` — if any of those happen to be your real site ids, be especially careful.
 
-### Re-running it later
+### Re-running it later — day two
 
-Safe, and the intended way to take generator updates:
+This is the case that matters. Six months in, the tree is full of your work and
+somebody re-runs the generator to pick up an update. That must not be able to
+revert anything.
+
+**With no flag, nothing that already exists is ever overwritten.** A file whose
+content differs is kept, reported, and the run exits `2`. New files are still
+added, so this is the safe way to pick up additions.
 
 ```bash
-./scripts/bootstrap.sh              # unchanged files untouched, edited files kept (exit 2)
-./scripts/bootstrap.sh --force      # refresh the generator's own output
-./scripts/bootstrap.sh --force-data # ALSO overwrite data/, inventory/, envs/
+./scripts/bootstrap.sh                  # add what is missing, touch nothing else
+./scripts/bootstrap.sh --dry-run        # report only
 ```
 
-It never deletes. `--force` refreshes modules, stacks, scripts, schemas, CI and
-docs, and cannot touch `data/`, `inventory/` or `envs/`. `--force-data` can, but
-still **refuses outright** for anything recorded in `data/.import-manifest.json`
-— adopted estate is never overwritten by this script, by any flag.
+**Overwriting takes a flag *and* a typed phrase.** The flag alone is not enough:
+the first file that would actually be overwritten stops the run and asks.
+
+```
+-------------------------------------------------------------------
+About to OVERWRITE files that already exist and differ from what this
+script generates. First one found: modules/group/main.tf
+
+Scope: Regenerated files only — modules, stacks, scripts, schemas, CI, docs.
+       Estate data in data/, inventory/ and envs/ will NOT be touched.
+
+This cannot be undone by re-running the script. If the tree is a git
+working copy, commit or stash first — that is your undo.
+-------------------------------------------------------------------
+
+Type exactly this phrase to continue, or anything else to abort:
+  wipe everything & start fresh
+>
+```
+
+Answer once and it covers the rest of that run. Anything other than the exact
+phrase aborts with nothing overwritten. The prompt names estate data explicitly
+when `--force-data` widened the scope to it.
+
+| Command | Overwrites |
+|---|---|
+| *(no flag)* | nothing — differing files kept, exit 2 |
+| `--force` | the generator's own output: modules, stacks, scripts, schemas, CI, docs. **Never** `data/`, `inventory/`, `envs/` |
+| `--force-data` | the above **and** estate data. Still refuses anything in `data/.import-manifest.json` |
+
+Three things hold no matter what you pass:
+
+- **It never deletes.** Files you added that the generator knows nothing about
+  are left alone in every mode.
+- **Imported estate is never overwritten.** Anything recorded in
+  `data/.import-manifest.json` is refused outright, flag and phrase or not.
+- **Without a terminal, an overwrite aborts** rather than proceeding. For a
+  pipeline, pass the phrase deliberately:
+
+  ```bash
+  ./scripts/bootstrap.sh --force --confirm 'wipe everything & start fresh'
+  # or BOOTSTRAP_CONFIRM='wipe everything & start fresh'
+  ```
+
+Your real undo is git. Commit before a `--force` run and the diff tells you
+exactly what the generator changed.
 
 ---
 
@@ -173,7 +249,110 @@ Not to this repository, not to another one, GitLab or otherwise:
 a different mechanism — an API GitLab hosts, not a file in a repository — and it
 is the right way to keep state in GitLab.
 
-### 2.2 Credentials — blocking
+### 2.2 Where the files live, and how changes get reviewed — first-run decision
+
+Asked at first run because it decides whether a firewall change is reviewable at
+all. It is **not** irreversible: `.gitlab-ci.yml`, the GitHub workflows and the
+helper scripts are generated whatever you pick, so changing your mind later
+costs one command.
+
+```
+  1) GitLab   — full CI/CD pipeline, set up for you      (recommended)
+  2) GitHub   — workflows written; you wire them up
+  3) Another git host — CI files written; you wire them up
+  4) Local files only — no versioning, no pipeline, manual apply
+```
+
+| Choice | Flag | Written | Done for you |
+|---|---|---|---|
+| **GitLab** *(default)* | `--vcs gitlab --git-remote URL` | `.gitlab-ci.yml`, child-pipeline generator, MR template | remote attached |
+| GitLab in Docker | `--vcs gitlab-docker` | same | server started, project created, pushed, runner registered, root password printed |
+| GitHub | `--vcs github` | `.github/workflows/{validate,plan,apply}.yml`, PR template | remote attached; **secrets and environment protection are yours** |
+| Another git host | `--vcs git` | both sets | remote attached; their location printed |
+| Local only | `--vcs none` | **nothing** | nothing — `make plan` / `make apply` by hand |
+
+`--ci gitlab\|github\|both\|none` overrides which pipeline is written, if you
+want GitHub workflows on a GitLab remote or anything else unusual.
+
+**GitLab is the default because it is the only one this script can take all the
+way** — server, project, runner, variables and gate. For GitHub the workflows
+are complete and correct, but the repository secrets and the apply environments
+are yours to configure, and nothing here can do it for you.
+
+The choice is recorded in `.nsx-bootstrap.conf`, so a later bare re-run keeps
+it. A tree set up as local-only will not sprout a pipeline because somebody
+re-ran the generator.
+
+#### Local only — the manual path
+
+No pipeline is written at all. The workflow is what it was before CI existed:
+
+```bash
+make validate                                 # schemas and conventions
+make plan  STACK=local-security SITE=lon1     # writes a saved plan
+make show  STACK=local-security SITE=lon1     # read it — this is the review
+APPROVE=yes make apply STACK=local-security SITE=lon1
+```
+
+`scripts/tf.sh` still refuses to apply without a saved plan, without
+`APPROVE=yes`, and through the placeholder local backend — so the shape of the
+review survives even with nobody to review it. What is missing is the record of
+who changed what and why.
+
+Migrating later, from a tree with no versioning — this also **writes the
+pipeline files that were skipped**:
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --remote git@github.com:org/nsx.git --ci github
+scripts/enable-gitops.sh --local-gitlab
+```
+
+It refuses to commit if a state or plan file is present, and refuses outright if
+`.gitignore` does not exclude `*.tfstate` — committing state is the one mistake
+with no clean undo.
+
+#### What the pipeline gives you
+
+```
+edit data/policies/payments.yaml
+  -> push, open a merge request
+  -> VALIDATE  schemas and conventions, offline, no credentials
+  -> PLAN      one job per manager, READ-ONLY credentials,
+               rendered plan posted onto the merge request
+  -> APPROVER  reads the plan, approves
+  -> MERGE     to the default branch
+  -> APPLY     MANUAL job, protected environment, applies the SAVED plan
+```
+
+**The apply never re-plans.** It applies the artifact the approver looked at, so
+what was reviewed is what reaches the firewall.
+
+Four of the controls live on the git host, not here, and a pipeline without them
+is one anybody can bypass:
+
+- branch protection on the default branch;
+- an approval requirement on merge requests;
+- `VAULT_PLAN_TOKEN` **read-only**, available everywhere;
+- `VAULT_APPLY_TOKEN` write and **protected**, so only protected branches can
+  apply.
+
+`docs/GITOPS.md` in the generated tree has the rest, including what the approver
+is checking.
+
+#### No GitLab? One command
+
+```bash
+scripts/gitlab-up.sh
+```
+
+GitLab CE and a runner in Docker, the project created and pushed, the runner
+registered, and the initial root password printed the way GitLab does it —
+readable again later with `scripts/gitlab-up.sh --password`. Needs Docker and
+about 4 GB of RAM, and first boot takes several minutes. It is a lab instance:
+no TLS, no backups, no HA.
+
+### 2.3 Credentials — blocking
 
 Credentials never live in this repository, and never pass through a Terraform
 data source: the `vault_*` data sources write the fetched secret into state in
@@ -184,7 +363,7 @@ in the environment. It assumes Vault KV v2 at the path recorded per manager in
 `inventory/managers.yaml`; the mount convention and auth method are yours to
 set. `vault_path` records **where the credential lives, never the credential**.
 
-### 2.3 Who tags the workloads — decide before writing group criteria
+### 2.4 Who tags the workloads — decide before writing group criteria
 
 Group membership resolves from tags, so this decides whether a membership change
 is reviewable. Two supported variants, covered in full in `docs/TAGGING.md`:
@@ -217,7 +396,7 @@ Mixing is per **VM**, never per tag. The boundary is enforced: every scope in
 `data/schema/tag-scopes.yaml` records its owning system, and `make validate`
 errors if `data/vm-tags/` writes a scope not owned by `terraform`.
 
-### 2.4 The rest
+### 2.5 The rest
 
 | Decision | Default taken | Revisit when |
 |---|---|---|
@@ -298,6 +477,41 @@ Two rules that matter more than the rest:
 Imported files are recorded in `data/.import-manifest.json` and are never
 overwritten by the generator, by any flag. Re-running the importer writes a
 `.new` sidecar rather than clobbering your edits.
+
+---
+
+## 4b. Are you ready?
+
+Generating the files is not the same as being ready to apply them.
+
+```bash
+make ready
+```
+
+It exits non-zero while anything blocks, so it works as a gate in a pipeline or
+a runbook. On a freshly generated tree it reports four blocking items, which is
+correct — that tree is not production ready:
+
+```
+BLOCK   state is still the placeholder local backend, which has NO LOCKING.
+BLOCK   no .terraform.lock.hcl committed.
+BLOCK   inventory/ and data/ are still the shipped EXAMPLE content.
+BLOCK   no git remote. Nothing is pushed, so nothing can be reviewed.
+```
+
+It also prints what it **cannot** see, because those live on your git host and
+in Vault rather than in this repository:
+
+- branch protection on the default branch;
+- an approval requirement on merge/pull requests;
+- `VAULT_ADDR` and a read-only `VAULT_PLAN_TOKEN`;
+- `VAULT_APPLY_TOKEN`, marked protected;
+- a protected environment (GitLab) or required reviewers (GitHub) on apply;
+- whether a `terraform plan` has ever run against a real manager.
+
+Delete `data/.example-content` once the estate data is yours — that is how you
+tell the check the data is real, and re-running the generator will not put it
+back.
 
 ---
 

@@ -10,9 +10,29 @@ writes the working tree — modules, stacks, schemas, tooling, CI and worked
 example data — into whatever directory you point it at.
 
 ```bash
-./scripts/bootstrap.sh --dir ~/work/nsx     # scaffold a working tree
+./scripts/bootstrap.sh          # interactive: pick basic or advanced, answer, done
+```
+
+```
+ 1) Basic deployment      — best practices assumed, four questions
+ 2) Advanced deployment   — every option asked
+ 3) Update an existing tree
+ 4) Add version control and the review pipeline to an existing tree
+ 5) Dry run               — show what a basic run would write
+```
+
+**Basic** asks where to put it, **where the files live and how changes get
+reviewed**, which state backend, and whether to include the worked example —
+everything else takes the recommended answer. **Advanced** asks about every
+flag. Either way it prints the equivalent command line before it
+writes anything, so one pass teaches you the scripted form:
+
+```bash
+./scripts/bootstrap.sh --dir ~/work/nsx --backend gitlab --git-init
 cd ~/work/nsx && make validate              # offline checks, no credentials
 ```
+
+Any flag on the command line suppresses the menu, so CI is unaffected.
 
 `docs/SETUP.md` walks the whole thing, including the choices you have to make.
 
@@ -69,9 +89,54 @@ It is self-contained: no network, no package install, and no dependency on this
 repository once generated. It copies itself and `docs/ARCHITECTURE.md` into the
 tree it creates, so that tree can regenerate and update itself.
 
-It is also idempotent and non-destructive. `--force` refreshes only the
-generator's own output; estate data needs `--force-data`, and anything recorded
-as imported from a live manager is never overwritten by any flag.
+It is also idempotent and non-destructive — see below.
+
+## A rule change is a merge request
+
+Nobody edits the firewall. They edit a file, and a pipeline turns that into a
+plan somebody approves:
+
+```
+edit data/policies/payments.yaml
+  -> push, open a merge request
+  -> VALIDATE  schemas and conventions, offline, no credentials
+  -> PLAN      one job per manager, READ-ONLY credentials,
+               rendered plan posted onto the merge request
+  -> APPROVER  reads the plan, approves
+  -> MERGE     to the default branch
+  -> APPLY     MANUAL job, protected environment, applies the SAVED plan
+```
+
+**The apply never re-plans.** It applies the artifact the approver looked at, so
+what was reviewed is what reaches the firewall.
+
+**GitLab is the default**, because it is the only host this script can take all
+the way — server, project, runner, CI variables and the approval gate. GitHub
+gets complete workflows, but its secrets and environment protection are yours to
+set. Local-only writes no pipeline at all and leaves the manual path.
+
+| Choice | Written | Done for you |
+|---|---|---|
+| **GitLab** *(default)* | `.gitlab-ci.yml` + child pipeline + MR template | remote, and optionally the whole server |
+| GitHub | `.github/workflows/{validate,plan,apply}.yml` + PR template | remote only |
+| Another git host | both | remote only; location printed |
+| Local only | nothing | nothing — `make plan` / `make apply` |
+
+Three ways to turn it on:
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab   # no GitLab? stand one up in Docker
+scripts/bootstrap.sh                      # or answer the question at first run
+```
+
+`--local-gitlab` runs GitLab CE and a runner in Docker, creates the project,
+pushes, registers the runner, and prints the initial root password. A lab
+instance, not a production one.
+
+The per-manager jobs come from `inventory/managers.yaml`, so adding an eleventh
+Local Manager stays a data change. GitLab and GitHub read the same
+`scripts/ci_matrix_lib.py` and cannot drift apart.
 
 ## Why the state is split five ways
 
@@ -89,18 +154,86 @@ never force Terraform to refresh transport zones.
 Adding an eleventh Local Manager is a data change in `inventory/managers.yaml`,
 not a code change: CI derives its run matrix from there.
 
+## Re-running the generator is safe
+
+The case that matters is day two: months in, the tree is full of your work, and
+somebody re-runs the generator to pick up an update.
+
+**With no flag, nothing that already exists is ever overwritten.** Differing
+files are kept and reported, and the run exits `2`. Missing files are still
+added, so this is the safe way to take additions.
+
+**Overwriting takes a flag *and* a typed phrase.** `--force` alone does not do
+it — the first file that would be overwritten stops the run and asks you to type
+`wipe everything & start fresh` in full. Anything else aborts with nothing
+changed. The prompt states whether estate data is in scope.
+
+Three things hold in every mode: it **never deletes**; imported estate recorded
+in `data/.import-manifest.json` is **never** overwritten, flag and phrase or not;
+and without a terminal an overwrite **aborts** instead of proceeding (pipelines
+pass `--confirm 'wipe everything & start fresh'` deliberately).
+
+| Command | Overwrites |
+|---|---|
+| *(no flag)* | nothing — differing files kept, exit 2 |
+| `--force` | generator output only: modules, stacks, scripts, schemas, CI, docs |
+| `--force-data` | the above **and** `data/`, `inventory/`, `envs/` |
+
+Details in [`docs/SETUP.md`](docs/SETUP.md#re-running-it-later--day-two).
+
+## Documentation
+
+Two documents live here. The rest are written into the tree the generator
+creates, because they describe that tree.
+
+### In this repository
+
+| Document | Read it for |
+|---|---|
+| **[`README.md`](README.md)** *(this file)* | What this is, what it produces, and current status. Start here. |
+| **[`docs/SETUP.md`](docs/SETUP.md)** | Standing up your own, end to end: prerequisites, generating, the decisions that are yours, greenfield vs brownfield, first contact with a manager, daily use, troubleshooting. |
+| **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** | The design and the operating rules — 16 sections. The reference, not the tutorial. Copied into every generated tree. |
+
+### Written into the generated tree
+
+| Document | Read it for |
+|---|---|
+| `README.md` | Orientation for whoever opens that repository. |
+| `docs/ARCHITECTURE.md` | The same reference, carried across so its links resolve. |
+| `docs/STRUCTURE.md` | What each directory is for, and what must *not* go in it. |
+| `docs/TAGGING.md` | Who applies tags — the two variants, the ownership constraint, and how the boundary is enforced. |
+| `docs/IMPORT.md` | Adopting an estate that already exists: the tranche workflow. |
+| `docs/GITOPS.md` | The review flow end to end, the CI variables, the branch protection it depends on, and what the approver is checking. |
+| `deploy/gitlab/README.md` | Running a local GitLab in Docker. |
+| `modules/*/README.md` | Input shape and gotchas, one per module. |
+| `stacks/*/README.md` | Cadence, blast radius, approver, and what the stack consumes. |
+| `inventory/README.md` | How the manager registry drives everything else. |
+
+### Where to start, by question
+
+| You want to | Go to |
+|---|---|
+| Understand what this is | this README |
+| Stand one up | `docs/SETUP.md` |
+| Know why it is built this way | `docs/ARCHITECTURE.md` §1–§9 |
+| Avoid breaking a live firewall | `docs/ARCHITECTURE.md` §2 — ten failure modes |
+| Add a firewall rule | `docs/ARCHITECTURE.md` §8, §10 |
+| Decide who tags workloads | `docs/TAGGING.md` |
+| Choose a state backend | `docs/SETUP.md` §2.1 |
+| Get changes reviewed before they apply | `docs/SETUP.md` §2.2, then `docs/GITOPS.md` |
+| Adopt an existing estate | `docs/IMPORT.md` |
+| Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
+| Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
+
 ## Repository contents
 
 | Path | What it is |
 |---|---|
 | `scripts/bootstrap.sh` | The generator. Every file it writes is embedded in it. |
-| `docs/ARCHITECTURE.md` | The design, the conventions, and the operating rules. Copied into every generated tree. |
+| `docs/ARCHITECTURE.md` | The design, the conventions, and the operating rules. |
 | `docs/SETUP.md` | How to stand up your own, and the variants on offer. |
+| `README.md` | This file. |
 | `LICENSE` | Apache-2.0. |
-
-`docs/IMPORT.md`, `docs/STRUCTURE.md` and `docs/TAGGING.md` are referenced from
-`docs/ARCHITECTURE.md` but are written by the generator — you will find them in
-the tree it creates, not here.
 
 ## Status — read before acting
 

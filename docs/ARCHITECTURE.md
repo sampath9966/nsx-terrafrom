@@ -893,31 +893,54 @@ aspirational.
 ### Scaffolding
 
 ```bash
-scripts/bootstrap.sh                  # scaffold into the current directory
+scripts/bootstrap.sh                  # interactive menu: basic / advanced / update
+scripts/bootstrap.sh --interactive    # force the menu even with other flags
+scripts/bootstrap.sh --no-interactive # never prompt; flags and defaults only
 scripts/bootstrap.sh --dir PATH       # scaffold somewhere else
 scripts/bootstrap.sh --dry-run        # report what would be written
 scripts/bootstrap.sh --force          # refresh regenerated files only
 scripts/bootstrap.sh --force-data     # also overwrite estate data (see below)
+scripts/bootstrap.sh --confirm TEXT   # the overwrite phrase, for a pipeline
 scripts/bootstrap.sh --no-examples    # structure and tooling, no example data
 scripts/bootstrap.sh --backend TYPE   # gitlab | s3 | azure | local (aliases ok)
+scripts/bootstrap.sh --vcs KIND       # gitlab (default) | gitlab-docker |
+                                     #   github | git | none
+scripts/bootstrap.sh --ci PLATFORM   # gitlab | github | both | none
+scripts/bootstrap.sh --git-remote URL # attach 'origin'; implies --vcs git
 scripts/bootstrap.sh --git-init       # also 'git init' if not already a repo
 ```
+
+Run bare with a terminal it asks: basic (best practices assumed, three
+questions), advanced (every option), or update an existing tree. Any flag
+suppresses the menu, so scripts and CI are unaffected; without a terminal it
+behaves exactly as it always did.
 
 Self-contained: no network, no dependency on the repository it came from, bash
 and coreutils only. Idempotent — an unchanged file is left alone, an edited one
 is kept and reported (exit 2) unless `--force`. It never deletes anything.
 
+**Nothing existing is overwritten without a flag AND a typed phrase.** With no
+flag, a file whose content differs is kept and reported and the run exits 2.
+With `--force` or `--force-data`, the first file that would actually be
+overwritten stops the run and asks for `wipe everything & start fresh`, typed in
+full; answering covers the rest of the run, anything else aborts with nothing
+changed. Without a terminal it aborts rather than proceeding — a pipeline passes
+`--confirm` or `BOOTSTRAP_CONFIRM` deliberately. A flag in shell history should
+not be able to revert a tree somebody has spent months editing.
+
 **`--force` cannot touch your estate.** It refreshes this script's own output —
 modules, stacks, scripts, schemas, CI, docs — and leaves `data/`, `inventory/`
 and `envs/` alone. Overwriting those needs `--force-data`, which still refuses
 outright for anything recorded in `data/.import-manifest.json`. Imported estate
-is never overwritten by this script, by any flag.
+is never overwritten by this script, by any flag or phrase.
 
 ### Make targets
 
 ```bash
 make help              # list targets
 make preflight         # which required tools are present
+make ready             # production readiness: exits 1 while anything blocks
+make selftest          # prove the generator and validators, offline
 make validate          # schema-validate + fmt-check. Offline, no credentials.
 make schema-validate   # data/ and inventory/ only
 make fmt               # terraform fmt -recursive .
@@ -945,14 +968,47 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/tf.sh init\|plan\|show\|apply STACK SITE` | Terraform for one stack against one manager. `-parallelism=5`; override with `PARALLELISM`. |
 | `scripts/with-credentials.sh SITE [--from vault\|vcf] -- CMD` | Fetches credentials, exports `NSXT_*`, execs `CMD`. Nothing written to disk. |
 | `scripts/preflight.sh` | Reports missing tools. Read-only. |
+| `scripts/selftest.sh [--quick]` | Proves what can be proved offline: the generator, every validator against planted defects, terraform fmt and validate, pipeline shape (no apply on a merge request, every apply manual), determinism, the overwrite guard, and that readiness refuses a fresh tree. 34 checks. Exits 1 on the first failure. |
+| `scripts/readiness.sh [--quiet]` | Answers "is this ready for production": placeholder backend, missing lock files, example data still in place, no remote, state tracked in git, validation failing. Exits 1 while anything blocks. Also prints what it *cannot* check — branch protection, CI variables, and whether a plan has ever run against a manager. |
 | `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
 | `scripts/tag-vm.py --site S --vm V --set SCOPE=VALUE` | Tags a VM as a data edit on `data/vm-tags/<site>.yaml`. Also `--unset SCOPE`, `--remove`, `--list`, `--dry-run`. Refuses any scope not owned by `terraform` in the vocabulary, and refuses to leave a VM with an empty tag set. |
 | `scripts/import-estate.py --site S [--from-dump F]` | Adopts a live estate: data files, Terraform import blocks, and the import manifest. `--dump-only` captures without converting. Never overwrites — writes `<name>.new` instead. |
 | `scripts/drift.sh STACK SITE` | Refresh-only plan, report to `reports/`. Exit 2 on drift. Never reverts, never writes `data/`. |
+| `scripts/enable-gitops.sh [--remote URL\|--local-gitlab]` | Puts an existing tree under version control and turns on the review pipeline. The migration path for anything set up without it. Refuses to commit if state or plan files are present. |
+| `scripts/gitlab-setup.sh --url U --token T --project G/N` | Makes a GitLab project ready: creates it (and the group), pushes, sets the CI variables with the apply token protected, protects the default branch, and creates the apply environments. Idempotent. Works against any GitLab; `gitlab-up.sh` calls it. `--dry-run` reports without changing anything. |
+| `scripts/gitlab-up.sh [--status\|--password\|--down\|--destroy]` | Brings up GitLab CE and a runner in Docker, creates the project, pushes, registers the runner, prints the initial root password. For teams without a GitLab. Not a production deployment. |
+| `scripts/gitlab-child-pipeline.py` | Emits the per-manager plan/apply jobs for GitLab from the inventory. Plans only on a merge request; plans plus **manual** applies on the default branch. |
+| `scripts/post-plan-comment.sh STACK SITE FILE` | Posts a rendered plan onto the merge request. Never posts the plan file itself. No-op outside an MR or without `CI_API_TOKEN`. |
+| `scripts/ci_matrix_lib.py` | The matrix itself, importable. `ci-matrix.py` and `gitlab-child-pipeline.py` both read it, so GitHub and GitLab cannot drift apart. |
 
 `scripts/validate-data.py` and `scripts/ci-matrix.py` need only Python 3.9+;
 PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
 subset when it is not.
+
+### Review pipeline
+
+The pipeline that gets written follows the host, and **GitLab is the default**:
+it is the only one this script can set up end to end — server, project, runner,
+variables and approval gate. GitHub gets complete workflows but the secrets and
+environment protection are the owner's to configure. `--vcs none` writes no
+pipeline at all and leaves the manual `make plan` / `make apply` path, which
+`scripts/tf.sh` still guards. The answer is recorded in `.nsx-bootstrap.conf` so
+a re-run does not change the shape of the tree.
+
+
+```bash
+scripts/enable-gitops.sh --remote git@gitlab.example.com:net/nsx.git
+scripts/enable-gitops.sh --local-gitlab      # stand GitLab up in Docker
+scripts/gitlab-up.sh --status                # where it is, whether it is up
+scripts/gitlab-up.sh --password              # the initial root password
+python3 scripts/gitlab-child-pipeline.py     # the per-manager jobs, as YAML
+```
+
+A rule edit becomes a merge request, a plan per manager posted onto it, an
+approval, a merge, and a **manual** apply of the plan that was approved — the
+apply never re-plans. `docs/GITOPS.md` is the full flow, including the branch
+protection and CI variables it depends on, which live on the git host rather
+than in this repository.
 
 ### CI
 
